@@ -282,8 +282,15 @@ String settings_processor(const String& var, BatteryEmulatorSettingsStore& setti
            capability_css("if-tricapable", battery_supports_triple);
   }
   if (var == "BATTCHEM") {
-    return options_for_enum((battery_chemistry_enum)settings.getUInt("BATTCHEM", (int)battery_chemistry_enum::NCA),
-                            name_for_chemistry);
+    // Autodetect is index 0 of battery_chemistry_enum, and enum_values_and_names()
+    // (used by plain options_for_enum) always skips index 0 as "unset" - so it
+    // has to be threaded through explicitly via options_for_enum_with_none, the
+    // same way BATTTYPE/CHGTYPE/etc. get their "None" option, or it can never be
+    // selected from this page for any battery driver that supports it (e.g. MG4).
+    // Default stays NCA - Autodetect is opt-in, not a new default for every battery.
+    return options_for_enum_with_none(
+        (battery_chemistry_enum)settings.getUInt("BATTCHEM", (int)battery_chemistry_enum::NCA), name_for_chemistry,
+        battery_chemistry_enum::Autodetect);
   }
   if (var == "INVTYPE") {
     return options_for_enum_with_none(
@@ -1710,7 +1717,7 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         pattern="[ -~]{1,63}" 
         title="Max 63 characters, printable ASCII only"/>
 
-        <label>Password: </label><input type='password' name='PASSWORD' value="%PASSWORD%" 
+        <label>Password: </label><input type='password' name='PASSWORD' value="%PASSWORD%" autocomplete="new-password"
         pattern="[ -~]{8,63}" 
         title="Password must be 8-63 characters long, printable ASCII only" placeholder='Leave blank to keep unchanged' />
 
@@ -1758,7 +1765,7 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         <input type='checkbox' name='WIFIAPENABLED' value='on' %WIFIAPENABLED% />
 
         <label>Access Point password: </label>
-        <input type='password' name='APPASSWORD' value="%APPASSWORD%" 
+        <input type='password' name='APPASSWORD' value="%APPASSWORD%" autocomplete="new-password"
         pattern="([ -~]{8,63})?"
         title="Password must be 8-63 characters long, printable ASCII only."
         placeholder='Leave blank to keep unchanged' />
@@ -1785,12 +1792,12 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         title="Web interface username, printable ASCII only" />
 
         <label>Web interface password: </label>
-        <input type='password' name='HTTPPASS' value="%HTTPPASS%"
+        <input type='password' name='HTTPPASS' value="%HTTPPASS%" autocomplete="new-password"
         pattern="[ -~]{0,63}"
         title="Set a password before enabling password protection. Printable ASCII only" placeholder='Leave blank to keep unchanged' />
 
         <label>Repeat web interface password: </label>
-        <input type='password' name='HTTPPASSCONFIRM' value="%HTTPPASS%"
+        <input type='password' name='HTTPPASSCONFIRM' value="%HTTPPASS%" autocomplete="new-password"
         pattern="[ -~]{0,63}"
         title="Repeat the web interface password" placeholder='Leave blank to keep unchanged' />
 
@@ -2288,7 +2295,7 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         <label>MQTT user: </label><input type='text' name='MQTTUSER' value="%MQTTUSER%"         
         pattern="[ -~]+"
         title="MQTT username can only contain printable ASCII" />
-        <label>MQTT password: </label><input type='password' name='MQTTPASSWORD' value="%MQTTPASSWORD%" 
+        <label>MQTT password: </label><input type='password' name='MQTTPASSWORD' value="%MQTTPASSWORD%" autocomplete="new-password"
         pattern="[ -~]+"
         title="MQTT password can only contain printable ASCII" placeholder='Leave blank to keep unchanged' />
         <label>MQTT timeout ms: </label>

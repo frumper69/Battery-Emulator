@@ -1,4 +1,5 @@
 #include "MG-4-BATTERY.h"
+#include <Arduino.h>  //For millis()
 #include <soc/soc.h>
 #include <cmath>    //For unit test
 #include <cstring>  //For unit test
@@ -448,6 +449,25 @@ void Mg4Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
         datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
 
         datalayer.battery.status.voltage_dV = (((rx_frame.data.u8[8] << 4) | (rx_frame.data.u8[9] >> 4)) * 5) / 2;
+
+        // Chemistry auto-detection: only runs when the user explicitly chose
+        // Autodetect, and only once. Settled pack voltage clusters cleanly by
+        // chemistry across every known MG4 variant regardless of series count
+        // (~337-355V for LFP, ~380-395V for NMC) - see CHEMISTRY_AUTODETECT_THRESHOLD_DV.
+        // Guarded on a plausible non-zero reading so we don't decide off a
+        // startup default of 0V.
+        if (!chemistry_autodetected && datalayer.battery.info.chemistry == battery_chemistry_enum::Autodetect &&
+            datalayer.battery.status.voltage_dV > 1000) {
+          chemistry_autodetected = true;
+          datalayer.battery.info.chemistry = (datalayer.battery.status.voltage_dV > CHEMISTRY_AUTODETECT_THRESHOLD_DV)
+                                                  ? battery_chemistry_enum::NMC
+                                                  : battery_chemistry_enum::LFP;
+          logging.printf("[MG4] Chemistry auto-detected: %s (pack voltage %.1fV)\n",
+                         (datalayer.battery.info.chemistry == battery_chemistry_enum::NMC) ? "NMC" : "LFP",
+                         datalayer.battery.status.voltage_dV / 10.0);
+          apply_cell_voltage_limits();
+        }
+
         current_raw = ((rx_frame.data.u8[6] << 8) | rx_frame.data.u8[7]);
         if (current_raw <= 40000) {
           // Only allow plausible values (-1000A to +1000A)
@@ -483,7 +503,38 @@ void Mg4Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
             // Cell voltages
 
             uint8_t mux = sub[7];
-            // 0x509 frames cover cells 1-80, 0x510 frames cover cells 81-104
+            // 0x509 frames always cover cells 1-80; 0x510 covers cells 81+ in
+            // groups of 4, so the highest mux value 0x510 actually reaches
+            // tells us this pack's true cell count (80 + max_mux*4) -
+            // 100s/104s/108s packs all send the first 80 cells over 0x509
+            // identically and only differ in how far 0x510 goes.
+            if (addr == 0x510 && mux >= 1 && mux <= MAX_PLAUSIBLE_MUX_0x510) {
+              if (mux > highest_mux_0x510_seen) {
+                highest_mux_0x510_seen = mux;
+                last_mux_0x510_increase_millis = millis();
+              }
+              // Only commit once the ramp has visibly stopped climbing for a
+              // while - not after any one value repeats N times, since an
+              // intermediate rung of the ramp can sit still for a while too
+              // if it happens to pace out slowly.
+              if (!cell_count_confirmed && highest_mux_0x510_seen > 0 &&
+                  (millis() - last_mux_0x510_increase_millis) >= CELL_COUNT_SETTLE_MS) {
+                uint8_t detected_cell_count = 80 + highest_mux_0x510_seen * 4;
+                if (detected_cell_count != datalayer.battery.info.number_of_cells) {
+                  logging.printf("[MG4] Cell count auto-detected: %d (was assuming %d)\n", detected_cell_count,
+                                 datalayer.battery.info.number_of_cells);
+                  datalayer.battery.info.number_of_cells = detected_cell_count;
+                  apply_cell_voltage_limits();  // max/min_design_voltage_dV depend on cell count
+                } else {
+                  // Settled reading agrees with what we already assumed -
+                  // nothing to change, but log it once so it's clear
+                  // detection actually ran and confirmed it, rather than
+                  // this being silence because detection never triggered.
+                  logging.printf("[MG4] Cell count confirmed: %d\n", detected_cell_count);
+                }
+                cell_count_confirmed = true;
+              }
+            }
             int celloffset = (addr == 0x509) ? (mux - 1) : 20 + (mux - 1);
 
             // Unpack the 4 cell voltages
@@ -644,7 +695,10 @@ void Mg4Battery::transmit_can(unsigned long currentMillis) {
     // observed to reopen contactors after ~15s (~3 loop cycles) when fed the
     // LFP-derived tables - the NMC variant exists to give it a lot more
     // non-repeating real traffic before it would ever loop.
-    const bool use_nmc_tables = (datalayer.battery.info.chemistry != battery_chemistry_enum::LFP);
+    // Explicit NMC check (not "!= LFP") so the brief window before chemistry
+    // auto-detection resolves (datalayer.battery.info.chemistry still
+    // Autodetect) falls back to the LFP-derived tables rather than NMC's.
+    const bool use_nmc_tables = (datalayer.battery.info.chemistry == battery_chemistry_enum::NMC);
     const int len_047_08a = use_nmc_tables ? mg4_fd::LEN_047_08A_NMC : mg4_fd::LEN_047;
     const int closed_tail_047_08a = use_nmc_tables ? mg4_fd::CLOSED_TAIL_START_047_08A_NMC : 304;
     const int len_313_314_315 = use_nmc_tables ? mg4_fd::LEN_313_314_315_NMC : mg4_fd::LEN_313;
@@ -775,33 +829,20 @@ uint16_t Mg4Battery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* dat
   return 0;  // Continue normal PID cycling
 }
 
-void Mg4Battery::setup(void) {  // Performs one time setup at startup
-  setup_uds(0x7E5, 0);
-  fd_uds_requests = true;
-
-  static const uint16_t POLL_LIST[] = {POLL_BATTERY_SOH, POLL_BATTERY_VOLTAGE, POLL_MIN_CELL_TEMPERATURE,
-                                       POLL_MAX_CELL_TEMPERATURE};
-
-  set_pid_scan_list(POLL_LIST, sizeof(POLL_LIST) / sizeof(POLL_LIST[0]));
-  dtc = &datalayer.battery.dtc;
-
-  strncpy(datalayer.system.info.battery_protocol, Name, 63);
-  datalayer.system.info.battery_protocol[63] = '\0';
-  datalayer.system.status.battery_allows_contactor_closing = true;
-  // The pack has its own internal, BMS-controlled contactors, driven via CAN
-  // rather than by BE-driven external relays. This tells the webserver to
-  // show detailed contactor status (via contactors_engaged) even when
-  // contactor_control_enabled is false.
-  datalayer.system.status.battery_reports_contactor_state = true;
-
-  datalayer.battery.info.chemistry = user_selected_battery_chemistry;
-  datalayer.battery.info.number_of_cells = 104;
-  datalayer.battery.info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_MV;
-
+void Mg4Battery::apply_cell_voltage_limits() {
   // Danger limits
   if (datalayer.battery.info.chemistry == battery_chemistry_enum::LFP) {
     datalayer.battery.info.max_cell_voltage_mV = 3700;
     datalayer.battery.info.min_cell_voltage_mV = 2500;
+  } else if (datalayer.battery.info.chemistry == battery_chemistry_enum::Autodetect) {
+    // Chemistry not yet known (auto-detect pending, see handle_incoming_can_frame's
+    // 0x12C handling). Use the safe intersection of every known MG4 variant's
+    // limits until real telemetry resolves it: LFP's own ceiling (3700mV) is a
+    // safe upper bound for an NMC pack too (just conservative), and NMC's own
+    // floor (2700mV) is a safe lower bound for an LFP pack too (LFP's real
+    // floor is lower, at 2500mV, so 2700mV stays inside it).
+    datalayer.battery.info.max_cell_voltage_mV = 3700;
+    datalayer.battery.info.min_cell_voltage_mV = 2700;
   } else {
     datalayer.battery.info.max_cell_voltage_mV = 4250;
     datalayer.battery.info.min_cell_voltage_mV = 2700;
@@ -810,7 +851,6 @@ void Mg4Battery::setup(void) {  // Performs one time setup at startup
   working_cell_max_mV = datalayer.battery.info.max_cell_voltage_mV - 150;
   working_cell_min_mV = datalayer.battery.info.min_cell_voltage_mV + 300;
   working_cell_recharge_threshold_mV = working_cell_max_mV - 100;
-  coulombCounting = user_selected_use_estimated_SOC;
   if (coulombCounting) {
     static const uint32_t MINIMUM_WORKING_RANGE_MV = 200;
     if (user_selected_max_cell_voltage_mV > (datalayer.battery.info.min_cell_voltage_mV + MINIMUM_WORKING_RANGE_MV) &&
@@ -835,6 +875,36 @@ void Mg4Battery::setup(void) {  // Performs one time setup at startup
       (datalayer.battery.info.number_of_cells * datalayer.battery.info.max_cell_voltage_mV) / 100;
   datalayer.battery.info.min_design_voltage_dV =
       (datalayer.battery.info.number_of_cells * datalayer.battery.info.min_cell_voltage_mV) / 100;
+}
+
+void Mg4Battery::setup(void) {  // Performs one time setup at startup
+  setup_uds(0x7E5, 0);
+  fd_uds_requests = true;
+
+  static const uint16_t POLL_LIST[] = {POLL_BATTERY_SOH, POLL_BATTERY_VOLTAGE, POLL_MIN_CELL_TEMPERATURE,
+                                       POLL_MAX_CELL_TEMPERATURE};
+
+  set_pid_scan_list(POLL_LIST, sizeof(POLL_LIST) / sizeof(POLL_LIST[0]));
+  dtc = &datalayer.battery.dtc;
+
+  strncpy(datalayer.system.info.battery_protocol, Name, 63);
+  datalayer.system.info.battery_protocol[63] = '\0';
+  datalayer.system.status.battery_allows_contactor_closing = true;
+  // The pack has its own internal, BMS-controlled contactors, driven via CAN
+  // rather than by BE-driven external relays. This tells the webserver to
+  // show detailed contactor status (via contactors_engaged) even when
+  // contactor_control_enabled is false.
+  datalayer.system.status.battery_reports_contactor_state = true;
+
+  datalayer.battery.info.chemistry = user_selected_battery_chemistry;
+  // Start from the 104s default (the most common known variant so far); the
+  // 0x510 mux-based auto-detect in handle_incoming_can_frame() will correct
+  // this within a few seconds for 100s/108s packs.
+  datalayer.battery.info.number_of_cells = 104;
+  datalayer.battery.info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_MV;
+  coulombCounting = user_selected_use_estimated_SOC;
+
+  apply_cell_voltage_limits();
 
   // Manually allocate addresses in the 512 bytes of ULP-reserved RTC slow
   // memory for storing the total discharge counter and a cookie to verify its

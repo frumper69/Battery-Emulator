@@ -18,7 +18,49 @@ class Mg4Battery : public UdsCanBattery {
   const char* get_dtc_json_filename() override { return "mg_dtc.json"; }
 
  private:
+  // (Re)computes max/min_cell_voltage_mV, the working cell-voltage window,
+  // and max/min_design_voltage_dV from the current chemistry, number_of_cells
+  // and user overrides. Called from setup(), and again whenever chemistry or
+  // cell count auto-detection resolves to something new at runtime.
+  void apply_cell_voltage_limits();
   static const uint16_t MAX_CELL_DEVIATION_MV = 150;
+
+  // --- Chemistry / cell-count auto-detection -------------------------------
+  // Known MG4 pack variants seen in the wild (2026-09): 49kWh LFP (100s),
+  // 51kWh LFP (104s), 64kWh NMC (104s), 77kWh NMC (108s). Cell count and
+  // chemistry vary independently of each other, so each is detected
+  // separately from real telemetry rather than assumed from one another.
+  //
+  // Chemistry: settled pack voltage clusters cleanly by chemistry regardless
+  // of series count (~337-355V observed for LFP variants, ~380-395V for NMC
+  // variants) - a threshold roughly in the middle of that ~25V gap separates
+  // them with plenty of margin. Only used when the user explicitly selects
+  // Autodetect; otherwise their selection is trusted as-is.
+  static const uint16_t CHEMISTRY_AUTODETECT_THRESHOLD_DV = 3650;  // 365.0V
+  bool chemistry_autodetected = false;
+
+  // Cell count: 0x159 addr 0x510 carries cells 81+ in groups of 4, muxed by
+  // its last payload byte. The highest mux value actually seen tells us how
+  // many cells beyond the first 80 (from addr 0x509) this pack really has,
+  // regardless of which of the known (or a future) variant it is.
+  //
+  // On power-up this mux value ramps 1,2,3,...,max once before settling and
+  // holding there - it does not cycle back down. That means any "commit
+  // after N repeats of the current value" scheme is unsound: an intermediate
+  // rung of the ramp (e.g. mux=1, 84 cells) can just as easily sit still for
+  // N repeats as the true final value can, if the ramp happens to pace out
+  // slowly - which is exactly what a debounce-by-repeat-count approach did
+  // in practice. Instead, only commit once the highest mux value seen has
+  // gone CELL_COUNT_SETTLE_MS without being exceeded - i.e. wait for the
+  // ramp to visibly stop climbing, not for any one value to repeat. Also
+  // reject implausible mux values outright (0x159's subframes carry no CRC
+  // of their own, unlike 313/314/315's family) since a corrupted byte could
+  // otherwise masquerade as "the ramp settled high".
+  static const uint8_t MAX_PLAUSIBLE_MUX_0x510 = 10;  // 80+10*4=120 cells, headroom past every known variant
+  static const unsigned long CELL_COUNT_SETTLE_MS = 1000;
+  uint8_t highest_mux_0x510_seen = 0;
+  unsigned long last_mux_0x510_increase_millis = 0;
+  bool cell_count_confirmed = false;  // logged once, whether or not it changed anything
 
   int32_t working_cell_min_mV = 0;
   int32_t working_cell_recharge_threshold_mV = 0;
