@@ -1,0 +1,866 @@
+#include <Arduino.h>
+#include "HardwareSerial.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "src/battery/BATTERIES.h"
+#include "src/charger/CHARGERS.h"
+#include "src/communication/Transmitter.h"
+#include "src/communication/can/comm_can.h"
+#include "src/communication/contactorcontrol/comm_contactorcontrol.h"
+#include "src/communication/equipmentstopbutton/comm_equipmentstopbutton.h"
+#include "src/communication/nvm/comm_nvm.h"
+#include "src/communication/precharge_control/precharge_control.h"
+#include "src/communication/rs485/comm_rs485.h"
+#include "src/datalayer/datalayer.h"
+#include "src/devboard/display/display.h"
+#include "src/devboard/espnow/espnow.h"
+#include "src/devboard/mqtt/mqtt.h"
+#include "src/devboard/safety/parallel_safety.h"
+#include "src/devboard/sdcard/sdcard.h"
+#include "src/devboard/utils/events.h"
+#include "src/devboard/utils/led_handler.h"
+#include "src/devboard/utils/logging.h"
+#include "src/devboard/utils/ota_confirm_gate.h"
+#include "src/devboard/utils/ota_rollback.h"
+#include "src/devboard/utils/time_meas.h"
+#include "src/devboard/utils/timer.h"
+#include "src/devboard/utils/types.h"
+#include "src/devboard/utils/value_mapping.h"
+#include "src/devboard/utils/version.h"
+#include "src/devboard/utils/watchdog.h"
+#include "src/devboard/webserver/webserver.h"
+#include "src/devboard/wifi/wifi.h"
+#include "src/inverter/INVERTERS.h"
+
+#if !defined(HW_LILYGO) && !defined(HW_LILYGO2CAN) && !defined(HW_STARK) && !defined(HW_3LB) && !defined(HW_BECOM) && \
+    !defined(HW_WAVESHARE) && !defined(HW_DEVKIT) && !defined(HW_DFROBOT_EDGE101)
+#error You must select a target hardware!
+#endif
+
+// The current software version, shown on webserver
+const char* version_number = BUILD_VERSION;
+
+// Interval timers. Time values are uint32_t on purpose: that is the width
+// millis() actually has on the target, so the wrap arithmetic is identical on
+// every platform (including the 64-bit host test build).
+volatile uint32_t currentMillis = 0;
+uint32_t previousMillis10ms = 0;
+uint32_t previousMillisUpdateVal = 0;
+// Task time measurement for debugging
+MyTimer core_task_timer_10s(INTERVAL_10_S);
+uint64_t start_time_10ms = 0;
+uint64_t start_time_values = 0;
+uint64_t start_time_cantx = 0;
+TaskHandle_t main_loop_task;
+TaskHandle_t connectivity_loop_task;
+#ifdef SDCARD
+TaskHandle_t logging_loop_task;
+#endif
+TaskHandle_t mqtt_loop_task;
+Watchdog mqtt_loop_watchdog;
+
+Logging logging;
+
+static std::list<Transmitter*> transmitters;
+void register_transmitter(Transmitter* transmitter) {
+  transmitters.push_back(transmitter);
+  DEBUG_PRINTF("transmitter registered, total: %d\n", transmitters.size());
+}
+
+// Initialization functions
+void init_serial() {
+  // Init Serial monitor
+  // Buffered TX so CAN-log bursts are absorbed instead of dropped; also makes
+  // availableForWrite() report ring-buffer space rather than raw FIFO space.
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+#if (HW_LILYGO2CAN || HW_BECOM || HW_WAVESHARE)
+  // Wait up to 100ms for Serial to be available. On the ESP32S3 Serial is
+  // provided by the USB controller, so will only work if the board is connected
+  // to a computer.
+  for (int i = 0; i < 10; i++) {
+    if (Serial)
+      break;
+    delay(10);
+  }
+#else
+  while (!Serial) {}
+#endif
+}
+
+void connectivity_loop(void*) {
+  esp_task_wdt_add(NULL);  // Register this task with WDT
+  // Init wifi
+  init_WiFi();
+
+  init_webserver();
+
+#ifndef SMALL_FLASH_DEVICE
+  init_display();
+#endif
+
+  if (espnow_enabled) {
+    init_espnow();
+  }
+
+  while (true) {
+    START_TIME_MEASUREMENT(wifi);
+    wifi_monitor();
+
+#ifndef SMALL_FLASH_DEVICE
+    update_display();
+#endif
+
+    if (espnow_enabled) {
+      update_espnow();
+    }
+
+    webserver_tick();
+
+    END_TIME_MEASUREMENT_MAX(wifi, datalayer.system.status.wifi_task_10s_max_us);
+
+    mqtt_loop_watchdog.panic_if_exceeded_ms(60000, "MQTT task watchdog reset triggered!");
+
+    esp_task_wdt_reset();  // Reset watchdog
+    delay(1);
+  }
+}
+
+#ifdef SDCARD
+void logging_loop(void*) {
+  bool sd_initialized = false;
+
+  init_logging_buffers();
+  sd_initialized = init_sdcard();
+
+  // If the SD failed to init (delete the buffers and disable SD logging)
+  if (!sd_initialized) {
+    deinit_logging_buffers();
+    datalayer.system.info.SD_logging_active = false;
+    datalayer.system.info.CAN_SD_logging_active = false;
+  }
+
+  while (sd_initialized) {
+    if (datalayer.system.info.SD_logging_active) {
+      write_log_to_sdcard();
+    }
+
+    if (datalayer.system.info.CAN_SD_logging_active) {
+      write_can_frame_to_sdcard();
+    }
+  }
+  // Delete the logging task only if SD failed to initialize to prevent panic.
+  vTaskDelete(NULL);
+}
+#endif  // SDCARD
+
+/* Linear charge power taper over the top of the SOC window: full power at
+   (100.00% - band), reaching 0W at 100.00% scaled SOC. Battery integration
+   independent - operates on the datalayer limits every battery driver rewrites
+   each cycle, so in-place scaling never compounds. Runs AFTER
+   update_machineryprotection() so its input includes safety-layer zeroing, and
+   BEFORE filter_inverter_limits() so the reduction passes through the low pass
+   filter instantly (decrease path) while recovery after SOC falls back below
+   the band gets the ramp. Independent from the low pass filter setting - the
+   user can enable none, either or both. */
+static void filter_charge_taper_soc(void) {
+  static bool taper_engaged_logged = false;
+  if (!charge_taper_soc || charge_taper_band_pptt == 0) {
+    return;  // Datalayer values pass through untouched
+  }
+  uint16_t soc = datalayer.battery.status.reported_soc;  // Computed earlier this cycle in update_calculated_values()
+  if (soc > 10000) {
+    soc = 10000;  // Defensive: keep (10000 - soc) non-negative if a driver misreports with SOC scaling disabled
+  }
+  uint16_t band = charge_taper_band_pptt;
+  if (band > 10000) {
+    band = 10000;
+  }
+  if (soc >= (10000 - band)) {
+    uint32_t charge_W = datalayer.battery.status.max_charge_power_W;
+
+    /* Apply the effective current cap (remote if active, otherwise user, same
+       precedence as update_calculated_values()) to the taper input, so the
+       band acts on the limit the inverter actually sees instead of on BMS
+       headroom above the cap. Idempotent with the min() applied again in
+       filter_inverter_limits() and driver-side by BYD-Modbus. */
+    uint16_t voltage_dV = datalayer.battery.status.voltage_dV;
+    if (voltage_dV <= 10) {
+      voltage_dV = datalayer.battery.info.max_design_voltage_dV;
+    }
+    if (voltage_dV > 10) {
+      uint16_t cap_dA = datalayer.battery.settings.remote_settings_limit_charge
+                            ? datalayer.battery.settings.max_remote_set_charge_dA
+                            : datalayer.battery.settings.max_user_set_charge_dA;
+      uint32_t cap_W = ((uint32_t)cap_dA * voltage_dV) / 100;
+      if (charge_W > cap_W) {
+        charge_W = cap_W;
+      }
+    }
+
+    uint32_t base_W = charge_W;  // Allowance entering the taper, after the user/remote cap
+    charge_W = (charge_W * (uint32_t)(10000 - soc)) / band;
+
+    /* Optional float charge power: hold a minimum charge power through the
+       tail of the band, dropping to 0W only at 100.00% scaled SOC. Keeps
+       inverters above their minimum stable charging power (avoids standby
+       cycling), provides a steady balancing trickle, and guarantees the
+       charge session terminates instead of asymptotically stalling below
+       full. Only applied when the allowance entering the taper is non-zero,
+       so it never overrides a zero coming from the BMS itself or from the
+       safety layer (cell overvoltage, battery full, pause states). */
+    if (base_W > 0 && charge_taper_floor_W > 0 && soc < 10000 && charge_W < charge_taper_floor_W) {
+      charge_W = charge_taper_floor_W;
+    }
+
+    datalayer.battery.status.max_charge_power_W = charge_W;
+
+    /* Pull the derived current limit down too, so current-based inverters are
+       covered when the low pass filter is disabled. min() only - the
+       user/remote/safety clamps already applied to the _dA field are never
+       raised. */
+    if (voltage_dV > 10) {
+      uint32_t charge_dA_from_power = (charge_W * 100) / voltage_dV;
+      if (charge_dA_from_power < datalayer.battery.status.max_charge_current_dA) {
+        datalayer.battery.status.max_charge_current_dA = (uint16_t)charge_dA_from_power;
+      }
+    }
+
+    if (!taper_engaged_logged) {
+      logging.printf("Charge power tapering based on SOC engaged at %.1f (real) %.1f (scaled)\n",
+                     datalayer.battery.status.real_soc / 100.0f, soc / 100.0f);
+      taper_engaged_logged = true;
+    }
+  } else if (soc < (10000 - band - 50)) {  // 0.5% hysteresis before re-arming the log entry
+    taper_engaged_logged = false;
+  }
+}
+
+/* Low pass filter for the battery power limits sent to the inverter (only when increasing,
+   10% new / 90% old per 1s cycle, ~10s time constant). Decreases take effect immediately.
+   Runs AFTER update_machineryprotection() so its input includes safety-layer zeroing
+   (pause, fault, battery full, voltage/cell limits) - otherwise a safety block release
+   would expose a filter state that never saw the zero, skipping the ramp entirely.
+   Filter state is kept locally, since battery drivers and the safety layer rewrite the
+   datalayer values every cycle. */
+static void filter_inverter_limits(void) {
+  if (!inverter_low_pass_filter) {
+    return;  // Datalayer values pass through untouched - identical to legacy behavior
+  }
+  static uint32_t charge_power_W_filtered = 0;
+  static uint32_t discharge_power_W_filtered = 0;
+  static bool power_filter_initialized = false;
+
+  /* Apply user current caps to the filter INPUT, so the ramp time constant acts on the
+     effective range instead of being accelerated by headroom above the cap. Also makes
+     runtime cap increases ramp instead of jump. BYD-Modbus applies the same min() again
+     driver-side, which is now idempotent. */
+  uint32_t charge_in = datalayer.battery.status.max_charge_power_W;
+  uint32_t discharge_in = datalayer.battery.status.max_discharge_power_W;
+  uint16_t cap_voltage_dV = datalayer.battery.status.voltage_dV;
+  if (cap_voltage_dV <= 10) {
+    cap_voltage_dV = datalayer.battery.info.max_design_voltage_dV;
+  }
+  if (cap_voltage_dV > 10) {
+    uint32_t user_charge_cap_W = ((uint32_t)datalayer.battery.settings.max_user_set_charge_dA * cap_voltage_dV) / 100;
+    uint32_t user_discharge_cap_W =
+        ((uint32_t)datalayer.battery.settings.max_user_set_discharge_dA * cap_voltage_dV) / 100;
+    if (charge_in > user_charge_cap_W) {
+      charge_in = user_charge_cap_W;
+    }
+    if (discharge_in > user_discharge_cap_W) {
+      discharge_in = user_discharge_cap_W;
+    }
+  }
+
+  if (!power_filter_initialized) {
+    charge_power_W_filtered = charge_in;
+    discharge_power_W_filtered = discharge_in;
+    power_filter_initialized = true;
+  } else {
+    if (charge_in > charge_power_W_filtered) {
+      charge_power_W_filtered = (charge_in * 10 + charge_power_W_filtered * 90) / 100;
+    } else {
+      charge_power_W_filtered = charge_in;
+    }
+
+    if (discharge_in > discharge_power_W_filtered) {
+      discharge_power_W_filtered = (discharge_in * 10 + discharge_power_W_filtered * 90) / 100;
+    } else {
+      discharge_power_W_filtered = discharge_in;
+    }
+  }
+  datalayer.battery.status.max_charge_power_W = charge_power_W_filtered;
+  datalayer.battery.status.max_discharge_power_W = discharge_power_W_filtered;
+
+  /* Cap the derived currents with values from the filtered power. min() logic is used so the
+     user/remote/safety clamps already applied to the _dA fields are never raised - both
+     are upper bounds. Same voltage fallback logic as in update_calculated_values(). */
+  uint16_t conversion_voltage_dV = datalayer.battery.status.voltage_dV;
+  if (conversion_voltage_dV <= 10) {
+    conversion_voltage_dV = datalayer.battery.info.max_design_voltage_dV;
+  }
+  if (conversion_voltage_dV > 10) {
+    uint32_t charge_dA_from_power = (charge_power_W_filtered * 100) / conversion_voltage_dV;
+    uint32_t discharge_dA_from_power = (discharge_power_W_filtered * 100) / conversion_voltage_dV;
+    if (charge_dA_from_power < datalayer.battery.status.max_charge_current_dA) {
+      datalayer.battery.status.max_charge_current_dA = (uint16_t)charge_dA_from_power;
+    }
+    if (discharge_dA_from_power < datalayer.battery.status.max_discharge_current_dA) {
+      datalayer.battery.status.max_discharge_current_dA = (uint16_t)discharge_dA_from_power;
+    }
+  }
+}
+
+void update_calculated_values(uint32_t currentMillis) {
+  /* Update CPU temperature*/
+  union {
+    float temp;
+    uint32_t hex;
+  } temp = {.temp = temperatureRead()};
+  if (temp.hex != 0x42555555) {  // Ignoring erroneous temperature value that ESP32 sometimes returns
+    //Apply calibration offset to the CPU temperature reading, if set. Some ESP32 chips report wildly inaccurate temperatures.
+    datalayer.system.info.CPU_temperature = temp.temp + (float)datalayer.system.info.CPU_temperature_calibration_offset;
+  }
+
+  /*Update free heap*/
+  datalayer.system.info.CPU_free_heap = ESP.getFreeHeap();
+
+  /* Check if remote set limits have timed out */
+  update_remote_limit_expiry(currentMillis);
+
+  /* Cap max charge/discharge to the lowest battery's limits */
+  if (battery2) {
+    if (datalayer.battery.status.max_charge_power_W > datalayer.battery2.status.max_charge_power_W) {
+      datalayer.battery.status.max_charge_power_W = datalayer.battery2.status.max_charge_power_W;
+    }
+    if (datalayer.battery.status.max_discharge_power_W > datalayer.battery2.status.max_discharge_power_W) {
+      datalayer.battery.status.max_discharge_power_W = datalayer.battery2.status.max_discharge_power_W;
+    }
+  }
+  if (battery3) {
+    if (datalayer.battery.status.max_charge_power_W > datalayer.battery3.status.max_charge_power_W) {
+      datalayer.battery.status.max_charge_power_W = datalayer.battery3.status.max_charge_power_W;
+    }
+    if (datalayer.battery.status.max_discharge_power_W > datalayer.battery3.status.max_discharge_power_W) {
+      datalayer.battery.status.max_discharge_power_W = datalayer.battery3.status.max_discharge_power_W;
+    }
+  }
+
+  /* Calculate allowed charge/discharge currents. Prefer live pack voltage for the conversion.
+     If unavailable (some drivers report 0 before battery comms are up), fall back to the design
+     max voltage - conservative, since it under-estimates current for a given power. If that is
+     also 0 (generic BMS drivers with no user-configured pack voltage, or BMS-reported cutoff
+     values before first frame), keep the previous values to avoid div0. */
+  uint16_t conversion_voltage_dV = datalayer.battery.status.voltage_dV;
+  if (conversion_voltage_dV <= 10) {
+    conversion_voltage_dV = datalayer.battery.info.max_design_voltage_dV;
+  }
+  if (conversion_voltage_dV > 10) {
+    datalayer.battery.status.max_charge_current_dA =
+        ((datalayer.battery.status.max_charge_power_W * 100) / conversion_voltage_dV);
+    datalayer.battery.status.max_discharge_current_dA =
+        ((datalayer.battery.status.max_discharge_power_W * 100) / conversion_voltage_dV);
+  }
+
+  /* Apply remote restrictions if set*/
+  if (datalayer.battery.settings.remote_settings_limit_charge) {
+    if (datalayer.battery.status.max_charge_current_dA > datalayer.battery.settings.max_remote_set_charge_dA) {
+      datalayer.battery.status.max_charge_current_dA = datalayer.battery.settings.max_remote_set_charge_dA;
+    }
+  } else {
+    /* Restrict values from user settings if needed*/
+    if (datalayer.battery.status.max_charge_current_dA > datalayer.battery.settings.max_user_set_charge_dA) {
+      datalayer.battery.status.max_charge_current_dA = datalayer.battery.settings.max_user_set_charge_dA;
+      datalayer.battery.settings.user_settings_limit_charge = true;
+    } else {
+      datalayer.battery.settings.user_settings_limit_charge = false;
+    }
+  }
+
+  /* Apply remote restrictions if set*/
+  if (datalayer.battery.settings.remote_settings_limit_discharge) {
+    if (datalayer.battery.status.max_discharge_current_dA > datalayer.battery.settings.max_remote_set_discharge_dA) {
+      datalayer.battery.status.max_discharge_current_dA = datalayer.battery.settings.max_remote_set_discharge_dA;
+    }
+  } else {
+    /* Restrict values from user settings if needed*/
+    if (datalayer.battery.status.max_discharge_current_dA > datalayer.battery.settings.max_user_set_discharge_dA) {
+      datalayer.battery.status.max_discharge_current_dA = datalayer.battery.settings.max_user_set_discharge_dA;
+      datalayer.battery.settings.user_settings_limit_discharge = true;
+    } else {
+      datalayer.battery.settings.user_settings_limit_discharge = false;
+    }
+  }
+
+  /* Calculate sum of all currents from all batteries. 0 if they are not used*/
+  datalayer.battery.status.reported_current_dA =
+      (datalayer.battery.status.current_dA + datalayer.battery2.status.current_dA +
+       datalayer.battery3.status.current_dA);
+
+  /* Calculate if battery or inverter is limiting factor*/
+  if (datalayer.battery.status.current_dA == 0) {  //Battery idle
+    if (datalayer.battery.status.max_discharge_current_dA > 0) {
+      //We allow discharge, but inverter does nothing. Inverter is limiting
+      datalayer.battery.settings.inverter_limits_discharge = true;
+    } else {
+      datalayer.battery.settings.inverter_limits_discharge = false;
+    }
+    if (datalayer.battery.status.max_charge_current_dA > 0) {
+      //We allow charge, but inverter does nothing. Inverter is limiting
+      datalayer.battery.settings.inverter_limits_charge = true;
+    } else {
+      datalayer.battery.settings.inverter_limits_charge = false;
+    }
+  } else if (datalayer.battery.status.current_dA < 0) {  //Battery discharging
+    if (-datalayer.battery.status.current_dA < datalayer.battery.status.max_discharge_current_dA) {
+      datalayer.battery.settings.inverter_limits_discharge = true;
+    } else {
+      datalayer.battery.settings.inverter_limits_discharge = false;
+    }
+  } else {  // > 0 Battery charging
+    //If actual current is smaller than max we allow, inverter is limiting factor
+    if (datalayer.battery.status.current_dA < datalayer.battery.status.max_charge_current_dA) {
+      datalayer.battery.settings.inverter_limits_charge = true;
+    } else {
+      datalayer.battery.settings.inverter_limits_charge = false;
+    }
+  }
+
+  /* Calculate active power based on voltage and current*/
+  datalayer.battery.status.active_power_W =
+      (datalayer.battery.status.current_dA * (datalayer.battery.status.voltage_dV / 100));
+  if (battery2) {
+    /* Calculate active power based on voltage and current for battery 2*/
+    datalayer.battery2.status.active_power_W =
+        (datalayer.battery2.status.current_dA * (datalayer.battery2.status.voltage_dV / 100));
+  }
+  if (battery3) {
+    /* Calculate active power based on voltage and current for battery 2*/
+    datalayer.battery3.status.active_power_W =
+        (datalayer.battery3.status.current_dA * (datalayer.battery3.status.voltage_dV / 100));
+  }
+
+  if (datalayer.battery.settings.soc_scaling_active) {
+    /** SOC Scaling
+   * A static version of a stochastic oscillator. The scaled SoC is calculated as:
+   *
+   *     10000 * (real_soc - min_percentage)
+   * ---------------------------------------
+   *     (max_percentage - min_percentage)
+   *
+   * And scaled capacity is:
+   *
+   *     reported_total_capacity_Wh = total_capacity_Wh * (max - min) / 10000
+   *     reported_remaining_capacity_Wh = reported_total_capacity_Wh * scaled_soc / 10000
+   */
+    // Compute delta_pct and clamped_soc
+    int32_t delta_pct = datalayer.battery.settings.max_percentage - datalayer.battery.settings.min_percentage;
+    int32_t clamped_soc = CONSTRAIN(datalayer.battery.status.real_soc, datalayer.battery.settings.min_percentage,
+                                    datalayer.battery.settings.max_percentage);
+    int32_t scaled_soc = 0;
+    int32_t scaled_total_capacity = 0;
+    if (delta_pct != 0) {  //Safeguard against division by 0
+      scaled_soc = 10000 * (clamped_soc - datalayer.battery.settings.min_percentage) / delta_pct;
+    }
+
+    datalayer.battery.status.reported_soc = scaled_soc;
+
+    // If battery info is valid
+    if (datalayer.battery.info.total_capacity_Wh > 0 && datalayer.battery.status.real_soc > 0) {
+      // Scale total usable capacity
+      scaled_total_capacity = (datalayer.battery.info.total_capacity_Wh * delta_pct) / 10000;
+      datalayer.battery.info.reported_total_capacity_Wh = scaled_total_capacity;
+
+      // Scale remaining capacity based on scaled SOC
+      datalayer.battery.status.reported_remaining_capacity_Wh = (scaled_total_capacity * scaled_soc) / 10000;
+
+    } else {
+      // Fallback if scaling cannot be performed
+      datalayer.battery.info.reported_total_capacity_Wh = datalayer.battery.info.total_capacity_Wh;
+      datalayer.battery.status.reported_remaining_capacity_Wh = datalayer.battery.status.remaining_capacity_Wh;
+    }
+
+    if (battery2) {
+      // If battery info is valid
+      if (datalayer.battery2.info.total_capacity_Wh > 0 && datalayer.battery.status.real_soc > 0) {
+
+        datalayer.battery2.info.reported_total_capacity_Wh = scaled_total_capacity;
+        // Scale remaining capacity based on scaled SOC
+        datalayer.battery2.status.reported_remaining_capacity_Wh = (scaled_total_capacity * scaled_soc) / 10000;
+
+      } else {
+        // Fallback if scaling cannot be performed
+        datalayer.battery2.info.reported_total_capacity_Wh = datalayer.battery2.info.total_capacity_Wh;
+        datalayer.battery2.status.reported_remaining_capacity_Wh = datalayer.battery2.status.remaining_capacity_Wh;
+      }
+
+      //Since we are running double battery, the scaled value of battery1 becomes the sum of battery1+battery2
+      //This way the inverter connected to the system sees both batteries as one large battery
+      datalayer.battery.info.reported_total_capacity_Wh += datalayer.battery2.info.reported_total_capacity_Wh;
+      datalayer.battery.status.reported_remaining_capacity_Wh +=
+          datalayer.battery2.status.reported_remaining_capacity_Wh;
+    }
+
+  } else {  // soc_scaling_active == false. No SOC window wanted. Set scaled SOC & capacity to same as real.
+    datalayer.battery.status.reported_soc = datalayer.battery.status.real_soc;
+
+    datalayer.battery.status.reported_remaining_capacity_Wh = datalayer.battery.status.remaining_capacity_Wh;
+    datalayer.battery.info.reported_total_capacity_Wh = datalayer.battery.info.total_capacity_Wh;
+
+    if (battery2) {
+      datalayer.battery.status.reported_remaining_capacity_Wh =
+          datalayer.battery.status.remaining_capacity_Wh + datalayer.battery2.status.remaining_capacity_Wh;
+      datalayer.battery.info.reported_total_capacity_Wh =
+          datalayer.battery.info.total_capacity_Wh + datalayer.battery2.info.total_capacity_Wh;
+    }
+    if (battery3) {
+      datalayer.battery.status.reported_remaining_capacity_Wh = datalayer.battery.status.remaining_capacity_Wh +
+                                                                datalayer.battery2.status.remaining_capacity_Wh +
+                                                                datalayer.battery3.status.remaining_capacity_Wh;
+      datalayer.battery.info.reported_total_capacity_Wh = datalayer.battery.info.total_capacity_Wh +
+                                                          datalayer.battery2.info.total_capacity_Wh +
+                                                          datalayer.battery3.info.total_capacity_Wh;
+    }
+  }
+
+  datalayer.battery2.status.reported_soc =
+      datalayer.battery2.status.real_soc;  //For screen to display correct SOC of battery 2
+  datalayer.battery3.status.reported_soc =
+      datalayer.battery3.status.real_soc;  //For screen to display correct SOC of battery 3
+
+  //Check each extra battery, and if they are at the extremes, report the SOC from these batteries instead
+  if (battery2 && datalayer.system.status.battery2_allowed_contactor_closing) {  //Battery2 is in the mix
+    if ((datalayer.battery2.status.real_soc < 100) || (datalayer.battery2.status.real_soc > 9900)) {
+      datalayer.battery.status.reported_soc = datalayer.battery2.status.real_soc;
+    }
+  }
+  if (battery3 && datalayer.system.status.battery3_allowed_contactor_closing) {  //Battery3 is in the mix
+    if ((datalayer.battery3.status.real_soc < 100) || (datalayer.battery3.status.real_soc > 9900)) {
+      datalayer.battery.status.reported_soc = datalayer.battery3.status.real_soc;
+    }
+  }
+}
+
+void check_reset_reason() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  switch (reason) {
+    case ESP_RST_UNKNOWN:  //Reset reason can not be determined
+      set_event(EVENT_RESET_UNKNOWN, reason);
+      break;
+    case ESP_RST_POWERON:  //OK Reset due to power-on event
+      set_event(EVENT_RESET_POWERON, reason);
+      break;
+    case ESP_RST_EXT:  //Reset by external pin (not applicable for ESP32)
+      set_event(EVENT_RESET_EXT, reason);
+      break;
+    case ESP_RST_SW:  //OK Software reset via esp_restart
+      set_event(EVENT_RESET_SW, reason);
+      break;
+    case ESP_RST_PANIC:  //Software reset due to exception/panic
+      set_event(EVENT_RESET_PANIC, reason);
+      break;
+    case ESP_RST_INT_WDT:  //Reset (software or hardware) due to interrupt watchdog
+      set_event(EVENT_RESET_INT_WDT, reason);
+      break;
+    case ESP_RST_TASK_WDT:  //Reset due to task watchdog
+      set_event(EVENT_RESET_TASK_WDT, reason);
+      break;
+    case ESP_RST_WDT:  //Reset due to other watchdogs
+      set_event(EVENT_RESET_WDT, reason);
+      break;
+    case ESP_RST_DEEPSLEEP:  //Reset after exiting deep sleep mode
+      set_event(EVENT_RESET_DEEPSLEEP, reason);
+      break;
+    case ESP_RST_BROWNOUT:  //Brownout reset (software or hardware)
+      set_event(EVENT_RESET_BROWNOUT, reason);
+      break;
+    case ESP_RST_SDIO:  //Reset over SDIO
+      set_event(EVENT_RESET_SDIO, reason);
+      break;
+    case ESP_RST_USB:  //Reset by USB peripheral
+      set_event(EVENT_RESET_USB, reason);
+      break;
+    case ESP_RST_JTAG:  //Reset by JTAG
+      set_event(EVENT_RESET_JTAG, reason);
+      break;
+    case ESP_RST_EFUSE:  //Reset due to efuse error
+      set_event(EVENT_RESET_EFUSE, reason);
+      break;
+    case ESP_RST_PWR_GLITCH:  //Reset due to power glitch detected
+      set_event(EVENT_RESET_PWR_GLITCH, reason);
+      break;
+    case ESP_RST_CPU_LOCKUP:  //Reset due to CPU lock up
+      set_event(EVENT_RESET_CPU_LOCKUP, reason);
+      break;
+    default:
+      break;
+  }
+}
+
+void core_loop(void*) {
+  esp_task_wdt_add(NULL);  // Register this task with WDT
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(1);  // Convert 1ms to ticks
+  int loopPhase = 0;
+
+  while (true) {
+    START_TIME_MEASUREMENT(all);
+    START_TIME_MEASUREMENT(comm);
+
+    // Input, Runs as fast as possible
+    receive_can();    // Receive CAN messages
+    receive_rs485();  // Process serial2 RS485 interface
+
+    END_TIME_MEASUREMENT_MAX(comm, datalayer.system.status.time_comm_us);
+
+    // Process
+    currentMillis = millis();
+
+    /* The OTA confirmation CHECK, and deliberately unconditional: reaching this
+       line is what it is measuring. A tick that has come round for 42 s has
+       received CAN, reached both the 10 ms and the 1 s sub-task, and fed the
+       task watchdog every pass - the strongest liveness witness the firmware
+       has. It sets a flag; loop() does the writing (ota_confirm_gate.h). */
+    ota_confirm_check(currentMillis);
+
+    loopPhase = 1 - loopPhase;  // Spread out slower tasks across multiple iterations
+    if (currentMillis - previousMillis10ms >= INTERVAL_10_MS && loopPhase == 0) {
+      if ((currentMillis - previousMillis10ms >= INTERVAL_10_MS_DELAYED) &&
+          (milliseconds(currentMillis) > esp32hal->BOOTUP_TIME())) {
+        set_event(EVENT_TASK_OVERRUN, (currentMillis - previousMillis10ms));
+      }
+      previousMillis10ms = currentMillis;
+      START_TIME_MEASUREMENT(10ms);
+      monitor_equipment_stop_button();
+      led_exe();
+      handle_contactors();  // Take care of startup precharge/contactor closing
+      if (precharge_control_enabled) {
+        handle_precharge_control(currentMillis);  //Drive the hia4v1 via PWM
+      }
+      if (battery) {
+        battery->handle_precharge();
+      }
+      END_TIME_MEASUREMENT_MAX(10ms, datalayer.system.status.time_10ms_us);
+    }
+
+    if (currentMillis - previousMillisUpdateVal >= INTERVAL_1_S && loopPhase == 1) {
+      previousMillisUpdateVal = currentMillis;  // Order matters on the update_loop!
+      START_TIME_MEASUREMENT(values);
+      update_pause_state();  // Check if we are OK to send CAN or need to pause
+
+      // Fetch battery values
+      if (battery) {
+        battery->update_values();
+      }
+
+      if (battery2) {
+        battery2->update_values();
+        check_parallel_battery_safety(2);
+      }
+      if (battery3) {
+        battery3->update_values();
+        check_parallel_battery_safety(3);
+      }
+      update_calculated_values(currentMillis);
+      update_machineryprotection();  // Check safeties
+      filter_charge_taper_soc();     // Taper charge limit near full SOC (runs after safeties, before LPF)
+      filter_inverter_limits();      // Smooth limits towards inverter (runs after safeties on purpose)
+
+      // Update values heading towards inverter
+      if (inverter) {
+        inverter->update_values();
+      }
+
+      if (inverter_modbus_watchdog_changed) {
+        // An inverter told us to use a different watchdog period. Storage is done here rather than
+        // in the driver, so no inverter protocol has to depend on NVM.
+        store_settings_inverter_watchdog();
+      }
+
+      update_restart_progress();  // Check if we need to restart the ESP32
+
+      END_TIME_MEASUREMENT_MAX(values, datalayer.system.status.time_values_us);
+    }
+    START_TIME_MEASUREMENT(cantx);
+
+    for (auto& transmitter : transmitters) {
+      transmitter->transmit(currentMillis);
+    }
+
+    END_TIME_MEASUREMENT_MAX(cantx, datalayer.system.status.time_cantx_us);
+
+    END_TIME_MEASUREMENT_MAX(all, datalayer.system.status.core_task_10s_max_us);
+    if (datalayer.system.info.performance_measurement_active) {
+      if (datalayer.system.status.core_task_10s_max_us > datalayer.system.status.core_task_max_us) {
+        // Update worst case total time
+        datalayer.system.status.core_task_max_us = datalayer.system.status.core_task_10s_max_us;
+        // Record snapshots of task times
+        datalayer.system.status.time_snap_comm_us = datalayer.system.status.time_comm_us;
+        datalayer.system.status.time_snap_10ms_us = datalayer.system.status.time_10ms_us;
+        datalayer.system.status.time_snap_values_us = datalayer.system.status.time_values_us;
+        datalayer.system.status.time_snap_cantx_us = datalayer.system.status.time_cantx_us;
+      }
+
+      datalayer.system.status.core_task_max_us =
+          MAX(datalayer.system.status.core_task_10s_max_us, datalayer.system.status.core_task_max_us);
+      if (core_task_timer_10s.elapsed()) {
+        datalayer.system.status.time_comm_us = 0;
+        datalayer.system.status.time_10ms_us = 0;
+        datalayer.system.status.time_values_us = 0;
+        datalayer.system.status.time_cantx_us = 0;
+        datalayer.system.status.core_task_10s_max_us = 0;
+        datalayer.system.status.wifi_task_10s_max_us = 0;
+        datalayer.system.status.mqtt_task_10s_max_us = 0;
+      }
+    }
+    esp_task_wdt_reset();  // Reset watchdog to prevent reset
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
+void mqtt_loop(void*) {
+  while (true) {
+    mqtt_loop_watchdog.update();
+
+    START_TIME_MEASUREMENT(mqtt);
+    mqtt_client_loop();
+    END_TIME_MEASUREMENT_MAX(mqtt, datalayer.system.status.mqtt_task_10s_max_us);
+    delay(100);
+  }
+}
+
+// Initialization
+void setup() {
+  init_hal();
+
+  init_serial();
+
+  // We print this after setting up serial, so that is also printed if configured to do so
+  DEBUG_PRINTF("Battery emulator %s build " __DATE__ " " __TIME__ "\n", version_number);
+
+  init_events();
+
+  /* Before anything that can itself fail: if the previous update never got
+     through setup(), this boot is the bootloader's doing and the user should be
+     told so even if this boot also goes badly. */
+  report_ota_rollback();
+
+  init_stored_settings();
+
+  // AP-button recovery must always run
+  xTaskCreatePinnedToCore((TaskFunction_t)&connectivity_loop, "connectivity_loop", 4096, NULL, TASK_CONNECTIVITY_PRIO,
+                          &connectivity_loop_task, esp32hal->WIFICORE());
+
+  led_init();
+
+#ifdef SDCARD
+  if (datalayer.system.info.CAN_SD_logging_active || datalayer.system.info.SD_logging_active) {
+    xTaskCreatePinnedToCore((TaskFunction_t)&logging_loop, "logging_loop", 4096, NULL, TASK_CONNECTIVITY_PRIO,
+                            &logging_loop_task, esp32hal->WIFICORE());
+  }
+#endif  // SDCARD
+
+  init_contactors();
+
+  // Release any pins latched across the reboot. MUST run after init_contactors(), which
+  // re-drives held pins (e.g. BMS_POWER HIGH) to their intended level while still latched;
+  // releasing then hands that level to the pad with no glitch. Runs unconditionally so a
+  // stale hold from a previous session is always cleared. No-op on boards without hold pins.
+  release_pins_across_reset();
+
+  init_precharge_control();
+
+  init_rs485();
+
+  setup_charger();
+  setup_inverter();
+  setup_battery();
+
+  /* Some battery types mandate the SOC-based charge power taper. Enforce at
+     runtime regardless of stored settings, and restrict the start SOC to
+     50-85% (band 1500-5000 pptt) for them. The settings UI reflects this by
+     rendering the checkbox checked and disabled. */
+  if (battery && battery->mandatory_charge_taper()) {
+    if (!charge_taper_soc) {
+      charge_taper_soc = true;
+      logging.println("Charge power tapering based on SOC is mandatory for this battery type, enabling");
+    }
+    if (charge_taper_band_pptt < 1500) {
+      charge_taper_band_pptt = 1500;  // Start SOC capped at 85% for mandatory-taper batteries
+      logging.println("Charge taper start SOC limited to 85% for this battery type");
+    } else if (charge_taper_band_pptt > 5000) {
+      charge_taper_band_pptt = 5000;  // Start SOC raised to 50% minimum
+    }
+  }
+
+  setup_shunt();
+
+  // Init CAN only after any CAN receivers have had a chance to register.
+  init_CAN();
+
+  init_equipment_stop_button();
+
+  // BOOT button at runtime is used as an input for various things
+  pinMode(0, INPUT_PULLUP);
+
+  check_reset_reason();
+
+  // Initialize Task Watchdog for subscribed tasks
+  esp_task_wdt_config_t wdt_config = {// 5s should be enough for the connectivity tasks (which are all contending
+                                      // for the same core) to yield to each other and reset their watchdogs.
+                                      .timeout_ms = INTERVAL_5_S,
+                                      // We don't benefit from idle task watchdogs, our critical loops have their
+                                      // own. The idle watchdogs can cause nuisance reboots under heavy load.
+                                      .idle_core_mask = 0,
+                                      // Panic (and reboot) on timeout
+                                      .trigger_panic = true};
+#ifdef CONFIG_ESP_TASK_WDT
+  // ESP-IDF will have already initialized it, so reconfigure.
+  // Arduino and PlatformIO have different watchdog defaults, so we reconfigure
+  // for consistency.
+  esp_task_wdt_reconfigure(&wdt_config);
+#else
+  // Otherwise initialize it for the first time.
+  esp_task_wdt_init(&wdt_config);
+#endif
+
+  // Start tasks
+
+  if (mqtt_enabled) {
+
+    if (init_mqtt()) {
+      logging.println("MQTT initialized successfully.");
+      xTaskCreatePinnedToCore((TaskFunction_t)&mqtt_loop, "mqtt_loop", 4096, NULL, TASK_MQTT_PRIO, &mqtt_loop_task,
+                              esp32hal->WIFICORE());
+    } else {
+      logging.println("MQTT failed to initialize. MQTT will be disabled.");
+    }
+  }
+
+  xTaskCreatePinnedToCore((TaskFunction_t)&core_loop, "core_loop", 4096, NULL, TASK_CORE_PRIO, &main_loop_task,
+                          esp32hal->CORE_FUNCTION_CORE());
+
+  /* No OTA confirmation here on purpose. Reaching the end of setup() only says
+     the drivers were constructed, and the crashes worth rolling back for happen
+     after that - the first frames parsed, the first MQTT or HTTP exchange, a
+     watchdog trip under real load. The image is confirmed once the running
+     system has held together for 42 s instead; see ota_confirm_gate.h. Placing
+     it here would also have raced the core_loop task that the line above just
+     started, which is a boundary decided by microseconds and worse than either
+     clean answer. */
+
+  DEBUG_PRINTF("Setup complete!\n");
+}
+
+// Ordinary main-task context. Everything else runs in tasks, so this stays the
+// place for work that must not be initiated from the 1 ms core tick - today the
+// otadata write that confirms a fresh image, once the tick says it has earned
+// it.
+void loop() {
+  ota_confirm_service();
+}

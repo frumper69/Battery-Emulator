@@ -1,0 +1,22 @@
+#ifndef _BMW_I3_HTML_H
+#define _BMW_I3_HTML_H
+
+#include "../../src/devboard/webserver/BatteryHtmlRenderer.h"
+#include "../datalayer/datalayer.h"
+#include "../datalayer/datalayer_extended.h"
+
+class BmwI3Battery;
+
+class BmwI3HtmlRenderer : public BatteryHtmlRenderer {
+ private:
+  BmwI3Battery& batt;
+
+ public:
+  BmwI3HtmlRenderer(BmwI3Battery& b) : batt(b) {}
+
+  bool renders_own_battery_data() { return true; }
+
+  String get_status_html();
+};
+
+#endif

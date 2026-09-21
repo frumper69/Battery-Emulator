@@ -1,0 +1,174 @@
+#ifndef BATTERY_H
+#define BATTERY_H
+
+#include <vector>
+#include "../../src/devboard/utils/types.h"
+#include "../../src/devboard/webserver/BatteryHtmlRenderer.h"
+
+enum class BatteryType {
+  None = 0,
+  BmwI3 = 2,
+  BmwIX = 3,
+  BoltAmpera = 4,
+  BydAtto3 = 5,
+  CellPowerBms = 6,
+  Chademo = 7,
+  CmfaEv = 8,
+  Foxess = 9,
+  GeelyGeometryC = 10,
+  OrionBms = 11,
+  Sono = 12,
+  StellantisEcmp = 13,
+  ImievCZeroIon = 14,
+  JaguarIpace = 15,
+  KiaEGmp = 16,
+  KiaHyundai64 = 17,
+  KiaHyundaiHybrid = 18,
+  Meb = 19,
+  Mg5 = 20,
+  NissanLeaf = 21,
+  Pylon = 22,
+  DalyBms = 23,
+  RjxzsBms = 24,
+  RangeRoverPhev = 25,
+  RenaultKangoo = 26,
+  RenaultTwizy = 27,
+  RenaultZoe1 = 28,
+  RenaultZoe2 = 29,
+  SantaFePhev = 30,
+  SimpBms = 31,
+  TeslaModel3Y = 32,
+  TeslaModelSX = 33,
+  TestFake = 34,
+  VolvoSpa = 35,
+  VolvoSpaHybrid = 36,
+  MgGen1 = 37,
+  SamsungSdiLv = 38,
+  HyundaiIoniq28 = 39,
+  Kia64FD = 40,
+  RelionBattery = 41,
+  RivianBattery = 42,
+  BmwPhev = 43,
+  FordMachE = 44,
+  CmpSmartCar = 45,
+  ThinkCity = 47,
+  TeslaLegacy = 48,
+  GrowattHvArk = 49,
+  GeelySea = 50,
+  ThunderstruckBMS = 51,
+  EnnoidBMS = 52,
+  StellantisSmallWide4x4 = 53,
+  ChargebyteCCSBattery = 54,
+  VAGMqbEvo = 55,
+  Akasol = 56,
+  GrowattLv = 57,
+  Mg4 = 96, // FIXME: order properly later
+  Highest
+};
+
+extern std::vector<BatteryType> supported_battery_types();
+extern const char* name_for_battery_type(BatteryType type);
+extern const char* name_for_chemistry(battery_chemistry_enum chem);
+extern const char* name_for_comm_interface(comm_interface comm);
+
+extern BatteryType user_selected_battery_type;
+extern bool user_selected_second_battery;
+extern bool user_selected_triple_battery;
+
+extern battery_chemistry_enum user_selected_battery_chemistry;
+
+// Abstract base class for next-generation battery implementations.
+// Defines the interface to call battery specific functionality.
+class Battery {
+ public:
+  virtual void setup(void) = 0;
+  virtual void update_values() = 0;
+
+  // The name of the comm interface the battery is using.
+  virtual const char* interface_name() = 0;
+
+  // These are commands from external I/O (UI, MQTT etc.)
+  // Override in battery if it supports them. Otherwise they are NOP.
+
+  /* True for battery types where the SOC-based charge power taper is
+     mandatory: the taper cannot be disabled and the start SOC is restricted
+     to 50-85%. Enforced at boot and reflected in the settings UI. */
+  virtual bool mandatory_charge_taper() { return false; }
+
+  virtual bool supports_clear_isolation() { return false; }
+  virtual bool supports_reset_BMS() { return false; }
+  virtual bool supports_reset_SOC() { return false; }
+  virtual bool supports_reset_crash() { return false; }
+  virtual bool supports_reset_NVROL() { return false; }
+  virtual bool supports_reset_DTC() { return false; }
+  virtual bool supports_read_DTC() { return false; }
+  virtual bool supports_reset_SOH() { return false; }
+  virtual bool supports_reset_BECM() { return false; }
+  virtual bool supports_calibrate_SOC() { return false; }
+  virtual bool supports_contactor_close() { return false; }
+  virtual bool supports_contactor_reset() { return false; }
+  virtual bool supports_set_fake_voltage() { return false; }
+  virtual bool supports_manual_balancing() { return false; }
+  virtual bool supports_real_BMS_status() { return false; }
+  virtual bool supports_toggle_SOC_method() { return false; }
+  virtual bool supports_energy_saving_mode_reset() { return false; }
+  virtual bool supports_factory_mode_method() { return false; }
+  virtual bool supports_chademo_restart() { return false; }
+  virtual bool supports_chademo_stop() { return false; }
+  virtual bool supports_balancing() { return false; }
+  virtual bool is_balancing_active() { return false; }
+  virtual const char* get_balancing_state_string() { return nullptr; }
+  // Like supports_balancing(), but renders independent Start and Stop buttons that are BOTH always
+  // visible (instead of a single toggle). Used by batteries where balancing is a latching request.
+  virtual bool supports_balancing_request() { return false; }
+  virtual bool supports_isolation_test() { return false; }
+
+  virtual void request_isolation_test() {}
+  virtual void clear_isolation() {}
+  virtual void calibrate_SOC() {}
+  virtual void reset_BMS() {}
+  virtual void reset_SOC() {}
+  virtual void reset_crash() {}
+  virtual void reset_contactor() {}
+  virtual void reset_NVROL() {}
+  virtual void reset_DTC() {}
+  virtual void read_DTC() {}
+  virtual void reset_SOH() {}
+  virtual void reset_BECM() {}
+  virtual void request_open_contactors() {}
+  virtual void request_close_contactors() {}
+  virtual void toggle_SOC_method() {}
+  virtual void reset_energy_saving_mode() {}
+  virtual void set_factory_mode() {}
+  virtual void chademo_restart() {}
+  virtual void chademo_stop() {}
+  virtual void initiate_balancing() {}
+  virtual void end_balancing() {}
+  virtual void handle_precharge() {}
+  virtual void action(uint32_t action_id, uint32_t value) {}
+
+  virtual void set_fake_voltage(float v) {}
+  virtual float get_voltage();
+
+  // This allows for battery specific SOC plausibility calculations to be performed.
+  virtual bool soc_plausible() { return true; }
+
+  // Battery reports total_charged_battery_Wh and total_discharged_battery_Wh
+  virtual bool supports_charged_energy() { return false; }
+
+  // Battery reports insulation/isolation resistance via
+  // datalayer status insulation_resistance_kOhm
+  virtual bool supports_insulation_resistance() { return false; }
+
+  virtual BatteryHtmlRenderer& get_status_renderer() { return defaultRenderer; }
+
+  /* Which pack this instance drives: 1, 2 or 3. The same driver code serves every pack, so a
+     driver cannot name its own battery in an event without this. Assigned centrally in
+     setup_battery() and passed to set_event() as the third argument. */
+  uint8_t battery_index = 1;
+
+ private:
+  BatteryDefaultRenderer defaultRenderer;
+};
+
+#endif

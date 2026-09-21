@@ -1,0 +1,67 @@
+name: Release Assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/compile-common-image.yml
+    with:
+      release_version: ${{ github.event.release.tag_name || inputs.tag }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Set release tag
+      id: vars
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Download compiled artifacts
+      uses: actions/download-artifact@v8
+      with:
+        pattern: "*.bin"
+        path: ./output
+        merge-multiple: true
+
+    - name: 🌐 Deploy to Web Installer repo
+      env:
+        WEB_INSTALLER_PUSH_TOKEN: ${{ secrets.WEB_INSTALLER_PUSH_TOKEN }}
+        REPO_OWNER: ${{ github.repository_owner }}
+      run: |
+        git clone https://$WEB_INSTALLER_PUSH_TOKEN@github.com/$REPO_OWNER/BE-Web-Installer web-installer
+        cd web-installer
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        mkdir -p images/${{ steps.vars.outputs.tag }}
+        cp ../output/*.factory.bin ../output/*.ota.bin images/${{ steps.vars.outputs.tag }}/
+        git add images
+        git commit -m "Deploy from GitHub Actions"
+        git push origin main
+
+    - name: 📡 Upload to GitHub Release
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: ${{ steps.vars.outputs.tag }}
+        files: |
+          output/*.ota.bin
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

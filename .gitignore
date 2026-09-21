@@ -1,0 +1,43 @@
+# Ignore any .vscode folder
+*.vscode/
+
+# Ignore any files in any build folder
+*build/
+
+# Ignore any generated test files from running locally
+test/CMakeCache.txt
+test/CMakeFiles/
+test/CTestTestfile.cmake
+test/Makefile
+test/cmake_install.cmake
+test/gtest/
+test/tests[1]_include.cmake
+
+# Ignore .exe (unit tests)
+*.exe
+**/.DS_Store
+
+#ignore platformio & compilation files
+.pioenvs
+.piolibdeps
+.clang_complete
+.gcc-flags.json
+.pio
+logs
+.dummy/
+managed_components/
+sdkconfig.*
+!sdkconfig.be_size.defaults
+
+# Ignore upload command (removes the need to re-compile after Verify when running Download, in e.g. VS Code)
+upload.bat
+compile.bat
+
+# Ignore binary files
+*.bin
+
+# Ignore generated ESP-IDF component manifest
+Software/idf_component.yml
+
+# Ignore generated version header (produced by tools/identify_build.py)
+Software/src/devboard/utils/version_autogen.h

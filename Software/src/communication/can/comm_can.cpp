@@ -1,0 +1,730 @@
+#include "comm_can.h"
+#include "../../lib/mcp2515_lite/mcp2515_lite.h"
+#include "../../lib/pierremolinaro-ACAN2517FD/ACAN2517FD.h"
+#include "../../lib/twai_lite/twai_lite.h"
+#include "CanReceiver.h"
+#include "comm_can.h"
+#include "src/datalayer/datalayer.h"
+#include "src/devboard/hal/hal.h"
+#include "src/devboard/safety/safety.h"
+#include "src/devboard/sdcard/sdcard.h"
+#include "src/devboard/utils/events.h"
+#include "src/devboard/utils/logging.h"
+#include "src/devboard/webserver/webserver_can_streaming.h"
+#include "utils.h"
+
+#include <algorithm>
+#include <map>
+
+volatile CAN_Configuration can_config = {.battery = CAN_NATIVE,
+                                         .inverter = CAN_NATIVE,
+                                         .battery_double = CAN_ADDON_MCP2515,
+                                         .battery_triple = CAN_ADDON_MCP2515,
+                                         .charger = CAN_NATIVE,
+                                         .shunt = CAN_NATIVE};
+
+struct CanReceiverRegistration {
+  CanReceiver* receiver;
+  CAN_Speed speed;
+};
+
+static std::multimap<CAN_Interface, CanReceiverRegistration> can_receivers;
+
+static void receive_frame_can_native();
+static void receive_frame_can_addon();
+static void receive_frame_canfd_addon();
+static void receive_frame_canfd_addon_2();
+static void map_can_frame_to_variable(CAN_frame* rx_frame, CAN_Interface interface);
+static void print_can_frame(CAN_frame frame, CAN_Interface interface, frameDirection msgDir);
+static uint32_t init_native_can(CAN_Speed speed, gpio_num_t tx_pin, gpio_num_t rx_pin);
+static bool begin_canfd();
+static bool begin_canfd_2();
+
+void register_can_receiver(CanReceiver* receiver, CAN_Interface interface, CAN_Speed speed) {
+  can_receivers.insert({interface, {receiver, speed}});
+  DEBUG_PRINTF("CAN receiver registered, total: %d\n", can_receivers.size());
+}
+
+static TWAI_Lite twai_lite;
+static TWAI_Lite_Speed native_speed;
+static CAN_Speed native_can_speed;
+static gpio_num_t native_tx_pin = GPIO_NUM_NC;
+static gpio_num_t native_rx_pin = GPIO_NUM_NC;
+
+static uint32_t quartz_frequency;
+
+static MCP2515_Lite* can2515 = nullptr;
+static SPIClass* SPI2515;
+
+static SPIClass* SPI2517;
+static ACAN2517FD* canfd = nullptr;
+static ACAN2517FDSettings* settings2517;
+static SPIClass* SPI2517_2;
+static ACAN2517FD* canfd_2 = nullptr;
+static ACAN2517FDSettings* settings2517_2;
+
+static bool native_can_initialized = false;
+//CAN logging filter settings
+uint16_t user_selected_CAN_ID_cutoff_filter = 0;  //Messages below this ID will not be logged in webserver
+
+bool init_CAN() {
+  // Native CAN (onboard the ESP32)
+
+  auto nativeIt = can_receivers.find(CAN_NATIVE);
+
+  if (nativeIt != can_receivers.end()) {
+    auto se_pin = esp32hal->CAN_SE_PIN();
+    auto tx_pin = esp32hal->CAN_TX_PIN();
+    auto rx_pin = esp32hal->CAN_RX_PIN();
+
+    if (se_pin != GPIO_NUM_NC) {
+      if (!esp32hal->alloc_pins("CAN", se_pin)) {
+        return false;
+      }
+      pinMode(se_pin, OUTPUT);
+      digitalWrite(se_pin, LOW);
+    }
+
+    if (!esp32hal->alloc_pins("CAN", tx_pin, rx_pin)) {
+      return false;
+    }
+
+    const uint32_t errorCode = init_native_can(nativeIt->second.speed, tx_pin, rx_pin);
+    if (errorCode == 0) {
+      native_can_initialized = true;
+      logging.println("Native Can ok");
+      logging.print("Actual bit rate:    ");
+      logging.print(twai_lite.actualBitRate());
+      logging.println(" bit/s");
+    } else {
+      logging.print("Error Native Can: 0x");
+      logging.println(errorCode, HEX);
+      return false;
+    }
+  }
+
+  // Add-on CAN interface (via MCP2515)
+
+  auto addonIt = can_receivers.find(CAN_ADDON_MCP2515);
+  if (addonIt != can_receivers.end()) {
+    auto cs_pin = esp32hal->MCP2515_CS();
+    auto int_pin = esp32hal->MCP2515_INT();
+    auto sck_pin = esp32hal->MCP2515_SCK();
+    auto miso_pin = esp32hal->MCP2515_MISO();
+    auto mosi_pin = esp32hal->MCP2515_MOSI();
+    auto rst_pin = esp32hal->MCP2515_RST();
+
+    if (!esp32hal->alloc_pins("CAN", cs_pin, int_pin, sck_pin, miso_pin, mosi_pin)) {
+      return false;
+    }
+
+    logging.println("Dual CAN Bus (ESP32+MCP2515) selected");
+
+    if (rst_pin != GPIO_NUM_NC) {
+      pinMode(rst_pin, OUTPUT);
+      digitalWrite(rst_pin, HIGH);
+      delay(100);
+      digitalWrite(rst_pin, LOW);
+      delay(100);
+      digitalWrite(rst_pin, HIGH);
+      delay(100);
+    }
+
+    SPI2515 = new SPIClass(esp32hal->MCP2515_BUS());
+    SPI2515->begin(sck_pin, miso_pin, mosi_pin);
+    can2515 = new MCP2515_Lite(*SPI2515, cs_pin, int_pin);
+
+    quartz_frequency = esp32hal->MCP2515_FREQ();
+    if (quartz_frequency == 0) {
+      quartz_frequency = can2515->autodetectOscillatorFrequency();
+    }
+
+    if (can2515->begin({(int)addonIt->second.speed * 1000UL, quartz_frequency})) {
+      logging.println("MCP2515 CAN ok");
+    } else {
+      logging.println("MCP2515 CAN init failed");
+      set_event(EVENT_CANMCP2515_INIT_FAILURE, 1);
+      // This will leak, but we have failed and won't try to reinit.
+      can2515 = nullptr;
+      return false;
+    }
+  }
+
+  // FD interface(s) (via MCP2518FD)
+
+  auto fdNativeIt = can_receivers.find(CANFD_NATIVE);
+  auto fdAddonIt = can_receivers.find(CANFD_ADDON_MCP2518);
+  auto fdAddonIt_2 = can_receivers.find(CANFD_ADDON_MCP2518_2);
+
+  if (fdNativeIt != can_receivers.end() || fdAddonIt != can_receivers.end() || fdAddonIt_2 != can_receivers.end()) {
+    // Initialise SPI bus first
+    auto sck_pin = esp32hal->MCP2517_SCK();
+    auto sdo_pin = esp32hal->MCP2517_SDO();
+    auto sdi_pin = esp32hal->MCP2517_SDI();
+
+    if (!esp32hal->alloc_pins("CANFD", sck_pin, sdo_pin, sdi_pin)) {
+      return false;
+    }
+
+    SPI2517 = new SPIClass(esp32hal->MCP2517_BUS());
+    SPI2517->begin(sck_pin, sdo_pin, sdi_pin);
+  }
+
+  if (fdNativeIt != can_receivers.end() || fdAddonIt != can_receivers.end()) {
+
+    auto speed = (fdNativeIt != can_receivers.end()) ? fdNativeIt->second.speed : fdAddonIt->second.speed;
+
+    auto cs_pin = esp32hal->MCP2517_CS();
+    auto int_pin = esp32hal->MCP2517_INT();
+
+    if (!esp32hal->alloc_pins("CANFD", cs_pin, int_pin)) {
+      return false;
+    }
+
+    canfd = new ACAN2517FD(cs_pin, *SPI2517, int_pin);
+
+    logging.println("CAN FD add-on (ESP32+MCP2517) selected");
+
+    const uint32_t freq = esp32hal->MCP2517_FREQ();
+    ACAN2517FDSettings::Oscillator osc_freq =
+        (freq == 0 ? ACAN2517FDSettings::OSC_AUTODETECT
+                   : (freq == 20000000 ? ACAN2517FDSettings::OSC_20MHz : ACAN2517FDSettings::OSC_40MHz));
+    auto bitRate = (int)speed * 1000UL;
+    settings2517 = new ACAN2517FDSettings(osc_freq, bitRate, DataBitRateFactor::x4);
+
+    // Set up clock output divider (some hardware uses this for the second CAN FD add-on)
+    settings2517->mCLKOPin = static_cast<ACAN2517FDSettings::CLKOpin>(esp32hal->MCP2517_CLKODIV());
+
+    // ListenOnly / Normal20B / NormalFDs
+    settings2517->mRequestedMode =
+        ACAN2517FDSettings::NormalFD;  //Startup in NormalFD mode, both for Classic CAN and CAN-FD messages
+
+    if (!begin_canfd()) {
+      return false;
+    }
+  }
+
+  if (fdAddonIt_2 != can_receivers.end()) {
+
+    auto cs_pin = esp32hal->MCP2517_CS2();
+    auto int_pin = esp32hal->MCP2517_INT2();
+
+    if (!esp32hal->alloc_pins("CANFD2", cs_pin, int_pin)) {
+      return false;
+    }
+
+    if (esp32hal->MCP2517_BUS() == esp32hal->MCP2517_BUS2()) {
+      // Use the same bus for both CAN FD chips
+      SPI2517_2 = SPI2517;
+    } else {
+      SPI2517_2 = new SPIClass(esp32hal->MCP2517_BUS2());
+
+      auto sck_pin = esp32hal->MCP2517_SCK2();
+      auto sdo_pin = esp32hal->MCP2517_SDO2();
+      auto sdi_pin = esp32hal->MCP2517_SDI2();
+
+      if (!esp32hal->alloc_pins("CANFD2", sck_pin, sdo_pin, sdi_pin)) {
+        return false;
+      }
+
+      SPI2517_2->begin(sck_pin, sdo_pin, sdi_pin);
+    }
+
+    canfd_2 = new ACAN2517FD(cs_pin, *SPI2517_2, int_pin);
+
+    logging.println("CAN FD add-on 2 (ESP32+MCP2517) selected");
+
+    const uint32_t freq = esp32hal->MCP2517_FREQ2();
+    ACAN2517FDSettings::Oscillator osc_freq =
+        (freq == 0 ? ACAN2517FDSettings::OSC_AUTODETECT
+                   : (freq == 20000000 ? ACAN2517FDSettings::OSC_20MHz : ACAN2517FDSettings::OSC_40MHz));
+
+    auto speed = fdAddonIt_2->second.speed;
+    auto bitRate = (int)speed * 1000UL;
+    // Crystal setting is ignored (library now autodetects)
+    settings2517_2 = new ACAN2517FDSettings(osc_freq, bitRate, DataBitRateFactor::x4);
+    // Arbitration bit rate: 250/500 kbit/s, data bit rate: 1/2 Mbit/s
+
+    settings2517_2->mRequestedMode =
+        ACAN2517FDSettings::NormalFD;  //Startup in NormalFD mode, both for Classic CAN and CAN-FD messages
+
+    if (!begin_canfd_2()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool begin_canfd() {
+  const uint32_t errorCode2517 = canfd->begin(*settings2517, [] { canfd->isr(); });
+  canfd->poll();
+  if (errorCode2517 != 0) {
+    logging.print("CAN-FD Configuration error 0x");
+    logging.println(errorCode2517, HEX);
+    set_event(EVENT_CANMCP2518FD_INIT_FAILURE, (uint8_t)errorCode2517);
+    // This will leak, but we have failed and won't try to reinit.
+    canfd = nullptr;
+    return false;
+  }
+  return true;
+}
+
+static bool begin_canfd_2() {
+  const uint32_t errorCode2517_2 = canfd_2->begin(*settings2517_2, [] { canfd_2->isr(); });
+  canfd_2->poll();
+  if (errorCode2517_2 != 0) {
+    logging.print("CAN-FD 2 Configuration error 0x");
+    logging.println(errorCode2517_2, HEX);
+    set_event(EVENT_CANMCP2518FD_INIT_FAILURE, (uint8_t)errorCode2517_2);
+    // This will leak, but we have failed and won't try to reinit.
+    canfd_2 = nullptr;
+    return false;
+  }
+  return true;
+}
+
+void transmit_can_frame_to_interface(const CAN_frame* tx_frame, CAN_Interface interface) {
+  if (!allowed_to_send_CAN) {
+    return;
+  }
+  print_can_frame(*tx_frame, interface, frameDirection(MSG_TX));
+
+#ifdef SDCARD
+  if (datalayer.system.info.CAN_SD_logging_active) {
+    add_can_frame_to_buffer(*tx_frame, interface, frameDirection(MSG_TX));
+  }
+#endif
+
+  switch (interface) {
+    case CAN_NATIVE: {
+      if (tx_frame->DLC > sizeof(CANMessage::data)) {
+        // An FD-length frame cannot be sent on a classic CAN interface (a CAN-FD
+        // battery configured on it produces these), and copying it below would
+        // overflow frame.data on the stack.
+        datalayer.system.info.can_native_send_fail = true;
+        break;
+      }
+
+      if (tx_frame->FD) {
+        //Native does not support CAN-FD, ignore
+        break;
+      }
+
+      TWAI_Lite_Frame frame;
+      copy_can_frame_to_twai_lite_frame(*tx_frame, frame);
+
+      if (!twai_lite.sendFrame(frame)) {
+        datalayer.system.info.can_native_send_fail = true;
+      }
+    } break;
+    case CAN_ADDON_MCP2515: {
+      if (tx_frame->DLC > sizeof(MCP2515_Lite_Frame::data)) {
+        // Same as CAN_NATIVE: an FD-length frame cannot travel over the MCP2515.
+        datalayer.system.info.can_2515_send_fail = true;
+        break;
+      }
+      MCP2515_Lite_Frame mcp2515_frame;
+      copy_can_frame_to_mcp2515_lite_frame(*tx_frame, mcp2515_frame);
+
+      if (can2515 == nullptr || !can2515->sendFrame(mcp2515_frame)) {
+        datalayer.system.info.can_2515_send_fail = true;
+      }
+    } break;
+    case CANFD_NATIVE:
+    case CANFD_ADDON_MCP2518: {
+      CANFDMessage MCP2518Frame;
+      if (tx_frame->FD) {
+        MCP2518Frame.type = CANFDMessage::CANFD_WITH_BIT_RATE_SWITCH;
+      } else {  //Classic CAN message
+        MCP2518Frame.type = CANFDMessage::CAN_DATA;
+      }
+      MCP2518Frame.id = tx_frame->ID;
+      MCP2518Frame.ext = tx_frame->ext_ID;
+      MCP2518Frame.len = tx_frame->DLC;
+      memcpy(MCP2518Frame.data, tx_frame->data.u8, std::min(tx_frame->DLC, (uint8_t)sizeof(MCP2518Frame.data)));
+
+      if (canfd == nullptr || !canfd->tryToSend(MCP2518Frame)) {
+        datalayer.system.info.can_2518_send_fail = true;
+      }
+    } break;
+    case CANFD_ADDON_MCP2518_2: {
+      CANFDMessage MCP2518Frame;
+      if (tx_frame->FD) {
+        MCP2518Frame.type = CANFDMessage::CANFD_WITH_BIT_RATE_SWITCH;
+      } else {  //Classic CAN message
+        MCP2518Frame.type = CANFDMessage::CAN_DATA;
+      }
+      MCP2518Frame.id = tx_frame->ID;
+      MCP2518Frame.ext = tx_frame->ext_ID;
+      MCP2518Frame.len = tx_frame->DLC;
+      memcpy(MCP2518Frame.data, tx_frame->data.u8, std::min(tx_frame->DLC, (uint8_t)sizeof(MCP2518Frame.data)));
+
+      if (canfd_2 == nullptr || !canfd_2->tryToSend(MCP2518Frame)) {
+        datalayer.system.info.can_2518_2_send_fail = true;
+      }
+    } break;
+    default:
+      // Invalid interface sent with function call. TODO: Raise event that coders messed up
+      break;
+  }
+}
+
+// Receive functions
+void receive_can() {
+  if (native_can_initialized) {
+    receive_frame_can_native();  // Receive CAN messages from native CAN port
+  }
+
+  if (can2515) {
+    receive_frame_can_addon();  // Receive CAN messages on add-on MCP2515 chip
+  }
+
+  if (canfd) {
+    receive_frame_canfd_addon();  // Receive CAN-FD messages.
+  }
+
+  if (canfd_2) {
+    receive_frame_canfd_addon_2();  // Receive CAN-FD messages on 2nd CAN-FD add-on.
+  }
+}
+
+static void
+receive_frame_can_native() {  // This section checks if we have a complete CAN message incoming on native CAN port
+  TWAI_Lite_Frame frame;
+
+  int count = 0;
+  while (count++ < 16 && twai_lite.receiveFrame(frame)) {
+    CAN_frame rx_frame;
+    copy_twai_lite_frame_to_can_frame(frame, rx_frame);
+
+    //message incoming, pass it on to the handler
+    map_can_frame_to_variable(&rx_frame, CAN_NATIVE);
+  }
+
+  // errorFlags() is a latched read-clear mask of what set the error status
+  // since the last poll. The live busOff() bit alone is unreliable: the ISR's
+  // recovery workaround (TEC re-trigger) usually brings the bus back before
+  // this task gets to poll, so use the latched ERR_BUS_OFF flag instead.
+  const uint8_t can_err_flags = twai_lite.errorFlags();
+  if (can_err_flags) {
+    datalayer.system.info.can_native_bus_error = true;
+    logging.printf("Native CAN errors: %s%s%s (tec=%u rec=%u rxHealth=%u)\n",
+                   (can_err_flags & TWAI_Lite::ERR_EWL) ? "EWL " : "",
+                   (can_err_flags & TWAI_Lite::ERR_BUS_OFF) ? "BUS_OFF " : "",
+                   (can_err_flags & TWAI_Lite::ERR_RX_EWL) ? "RX_EWL" : "", twai_lite.tec(), twai_lite.rec(),
+                   twai_lite.rxHealth());
+    if (can_err_flags & TWAI_Lite::ERR_BUS_OFF) {
+      // Leave bus-off via a full re-init (recovery is normally already done
+      // by the ISR's TEC re-trigger; this is belt and braces)
+      logging.println("Native CAN: resetting controller after bus-off");
+      change_can_speed(CAN_Interface::CAN_NATIVE, native_can_speed);
+    }
+  }
+
+  // Diagnostic heartbeat: log the CAN health every 10 s so slow climbs and
+  // recoveries are visible even without a latched error. rxHealth is the
+  // software REC mirror (see TWAI_Lite::rxHealth): it keeps climbing where
+  // the hardware rec can't, because the errata resets keep zeroing it.
+  static uint32_t last_health_log_ms = 0;
+  if (millis() - last_health_log_ms >= 10000) {
+    last_health_log_ms = millis();
+    logging.printf("Native CAN health: tec=%u rec=%u rxHealth=%u resets=%u\n", twai_lite.tec(), twai_lite.rec(),
+                   twai_lite.rxHealth(), (unsigned)twai_lite.periphResetCount());
+  }
+}
+
+static void
+receive_frame_can_addon() {  // This section checks if we have a complete CAN message incoming on add-on CAN port
+  MCP2515_Lite_Frame rx_frame;
+  CAN_frame full_frame;
+
+  int count = 0;
+  while (count++ < 16 && can2515->receiveFrame(rx_frame)) {
+    copy_mcp2515_lite_frame_to_can_frame(rx_frame, full_frame);
+    map_can_frame_to_variable(&full_frame, CAN_ADDON_MCP2515);
+  }
+
+  if (can2515->hasErrors()) {
+    datalayer.system.info.can_2515_bus_error = true;
+  }
+}
+
+static void _receive_frame_canfd(ACAN2517FD* canfd, bool first) {
+  CANFDMessage MCP2518frame;
+  int count = 0;
+  while (canfd->available() && count++ < 16) {
+    canfd->receive(MCP2518frame);
+
+    CAN_frame rx_frame;
+    rx_frame.ID = MCP2518frame.id;
+    rx_frame.ext_ID = MCP2518frame.ext;
+    rx_frame.DLC = MCP2518frame.len;
+    rx_frame.FD = (MCP2518frame.type == CANFDMessage::CANFD_NO_BIT_RATE_SWITCH ||
+                   MCP2518frame.type == CANFDMessage::CANFD_WITH_BIT_RATE_SWITCH);
+    memcpy(rx_frame.data.u8, MCP2518frame.data, std::min(rx_frame.DLC, (uint8_t)sizeof(rx_frame.data.u8)));
+    //message incoming, pass it on to the handler
+    if (first) {
+      map_can_frame_to_variable(&rx_frame, CANFD_ADDON_MCP2518);
+      map_can_frame_to_variable(&rx_frame, CANFD_NATIVE);
+    } else {
+      map_can_frame_to_variable(&rx_frame, CANFD_ADDON_MCP2518_2);
+    }
+  }
+
+  if (canfd->hasCanErrors()) {
+    if (first) {
+      datalayer.system.info.can_2518_bus_error = true;
+    } else {
+      datalayer.system.info.can_2518_2_bus_error = true;
+    }
+  }
+}
+
+static void receive_frame_canfd_addon() {
+  _receive_frame_canfd(canfd, true);
+}
+
+static void receive_frame_canfd_addon_2() {
+  _receive_frame_canfd(canfd_2, false);
+}
+
+// Support functions
+static void print_can_frame(CAN_frame frame, CAN_Interface interface, frameDirection msgDir) {
+
+  if (datalayer.system.info.CAN_usb_logging_active) {
+    // Build the whole line first, then write it in one go - and only if the TX
+    // buffer has room. This path runs in the core task: a blocked/slow USB host
+    // must never stall it (EVENT_TASK_OVERRUN). Frames that don't fit are
+    // counted and reported as a gap marker once the port drains.
+    static char usb_line[288];  // header + up to 64 CAN-FD data bytes at 3 chars each
+    static uint32_t usb_frames_dropped = 0;
+    unsigned long currentTime = millis();
+    size_t size = snprintf(usb_line, sizeof(usb_line), "(%lu.%02lu) %s%d %lX [%u] ", currentTime / 1000,
+                           (currentTime % 1000) / 10, (msgDir == MSG_RX) ? "RX" : "TX",
+                           (msgDir == MSG_RX) ? (int)(interface * 2) : (int)(interface * 2) + 1, frame.ID, frame.DLC);
+    for (uint8_t i = 0; i < frame.DLC; i++) {
+      size += snprintf(usb_line + size, sizeof(usb_line) - size, (i < frame.DLC - 1) ? "%02X " : "%02X\r\n",
+                       frame.data.u8[i]);
+    }
+    if (frame.DLC == 0) {
+      size += snprintf(usb_line + size, sizeof(usb_line) - size, "\r\n");
+    }
+
+    if ((size_t)Serial.availableForWrite() >= size) {
+      if (usb_frames_dropped > 0) {
+        char marker[48];
+        int marker_len =
+            snprintf(marker, sizeof(marker), "[%lu CAN frames not printed]\r\n", (unsigned long)usb_frames_dropped);
+        if ((size_t)Serial.availableForWrite() >= size + (size_t)marker_len) {
+          Serial.write((const uint8_t*)marker, marker_len);
+          usb_frames_dropped = 0;
+        }
+      }
+      Serial.write((const uint8_t*)usb_line, size);
+    } else {
+      usb_frames_dropped++;
+    }
+  }
+
+  if (datalayer.system.info.can_logging_active) {  // If user clicked on CAN Logging page in webserver, start recording
+    if (frame.ID > user_selected_CAN_ID_cutoff_filter) {  //Only log the message if CAN ID is higher than user set value
+      dump_can_frame(frame, interface, msgDir);
+    }
+  }
+  if (datalayer.system.info.can_streaming_active) {
+    stream_can_frame(frame, interface, msgDir);
+  }
+}
+
+static void map_can_frame_to_variable(CAN_frame* rx_frame, CAN_Interface interface) {
+  if (interface !=
+      CANFD_NATIVE) {  //Avoid printing twice due to receive_frame_canfd_addon sending to both FD interfaces
+    //TODO: This check can be removed later when refactored to use inline functions for logging
+    print_can_frame(*rx_frame, interface, frameDirection(MSG_RX));
+  }
+
+#ifdef SDCARD
+  if (datalayer.system.info.CAN_SD_logging_active) {
+    if (interface !=
+        CANFD_NATIVE) {  //Avoid printing twice due to receive_frame_canfd_addon sending to both FD interfaces
+      //TODO: This check can be removed later when refactored to use inline functions for logging
+      add_can_frame_to_buffer(*rx_frame, interface, frameDirection(MSG_RX));
+    }
+  }
+#endif
+
+  // Send the frame to all the receivers registered for this interface.
+  auto receivers = can_receivers.equal_range(interface);
+
+  for (auto it = receivers.first; it != receivers.second; ++it) {
+    auto& receiver = it->second;
+    receiver.receiver->receive_can_frame(rx_frame);
+  }
+}
+
+// For formatting CAN frames considerably faster than using snprintf
+static const char* hex = "0123456789abcdef";
+
+static char* put_hex(char* ptr, uint32_t value, uint8_t digits) {
+  for (int i = digits - 1; i >= 0; i--) {
+    *ptr++ = hex[(value >> (i * 4)) & 0x0f];
+  }
+  return ptr;
+}
+
+static char* put_time(char* ptr, unsigned long time) {
+  // Wrap around after 100000 seconds (about 27.7 hours)
+  if (time >= 100000000)
+    time = time % 100000000;
+
+  char buf[8];
+  int i = 0;
+  do {
+    buf[i++] = (time % 10) + '0';
+    time /= 10;
+  } while (time > 0);
+  while (i > 0) {
+    *ptr++ = buf[--i];
+    if (i == 3) {
+      *ptr++ = '.';
+    }
+  }
+  return ptr;
+}
+
+// CAN log formatter: "(12345.678) RX0 123 [8] 01 02 03 ... 0A\n".
+size_t format_can_frame(char* buffer, size_t len, const CAN_frame& frame, CAN_Interface interface,
+                        frameDirection msgDir) {
+  // Worst-case line length: '(' + up-to-8-digit time + optional '.' + ')' + ' '
+  // + "RX"/"TX" + channel digit + ' ' + 8-hex ID + ' ' + '[' + 2-digit DLC + ']'
+  // + 3 bytes per data byte + '\n'.
+  const size_t needed = 1 + 9 + 1 + 1 + 3 + 1 + 8 + 1 + 1 + 2 + 1 + (size_t)frame.DLC * 3 + 1;
+  if (needed > len) {
+    if (len > 0) {
+      buffer[0] = '\0';
+    }
+    return 0;
+  }
+
+  char* ptr = buffer;
+  const unsigned long currentTime = millis();
+  *ptr++ = '(';
+  ptr = put_time(ptr, currentTime);
+  *ptr++ = ')';
+  *ptr++ = ' ';
+  if (msgDir == MSG_RX) {
+    *ptr++ = frame.FD ? 'R' : 'r';
+    *ptr++ = frame.FD ? 'X' : 'x';
+    *ptr++ = '0' + ((int)interface * 2);
+  } else {
+    *ptr++ = frame.FD ? 'T' : 't';
+    *ptr++ = frame.FD ? 'X' : 'x';
+    *ptr++ = '1' + ((int)interface * 2);
+  }
+  *ptr++ = ' ';
+  if (frame.ext_ID)
+    ptr = put_hex(ptr, frame.ID, 8);
+  else
+    ptr = put_hex(ptr, frame.ID, 3);
+  *ptr++ = ' ';
+  *ptr++ = '[';
+  if (frame.DLC > 9) {
+    *ptr++ = '0' + (frame.DLC / 10);
+    *ptr++ = '0' + (frame.DLC % 10);
+  } else
+    *ptr++ = '0' + (frame.DLC);
+  *ptr++ = ']';
+  for (int i = 0; i < frame.DLC; i++) {
+    *ptr++ = ' ';
+    ptr = put_hex(ptr, frame.data.u8[i], 2);
+  }
+  *ptr++ = '\n';
+  *ptr = '\0';
+  return (size_t)(ptr - buffer);
+}
+
+void dump_can_frame(CAN_frame& frame, CAN_Interface interface, frameDirection msgDir) {
+  char* message_string = datalayer.system.info.logged_can_messages;
+  size_t offset =
+      datalayer.system.info.logged_can_messages_offset;  // Keeps track of the current position in the buffer
+  size_t message_string_size = sizeof(datalayer.system.info.logged_can_messages);
+
+  size_t written = format_can_frame(message_string + offset, message_string_size - offset, frame, interface, msgDir);
+  if (written == 0 && offset != 0) {
+    // Not enough space left at the tail - wrap around and start from the beginning
+    offset = 0;
+    written = format_can_frame(message_string, message_string_size, frame, interface, msgDir);
+  }
+  if (written > 0) {
+    datalayer.system.info.logged_can_messages_offset = offset + written;  // Update offset in buffer
+  }
+}
+
+void stop_can() {
+  if (can_receivers.find(CAN_NATIVE) != can_receivers.end()) {
+    twai_lite.end();
+  }
+
+  if (can2515) {
+    can2515->pause(true);
+  }
+
+  if (canfd) {
+    canfd->end();
+  }
+
+  if (canfd_2) {
+    canfd_2->end();
+  }
+}
+
+void restart_can() {
+  if (can_receivers.find(CAN_NATIVE) != can_receivers.end()) {
+    twai_lite.begin(native_speed, native_tx_pin, native_rx_pin);
+  }
+
+  if (can2515) {
+    can2515->pause(false);
+  }
+
+  if (canfd) {
+    begin_canfd();
+  }
+
+  if (canfd_2) {
+    begin_canfd_2();
+  }
+}
+
+// Initialize the native CAN interface with the given speed and pins.
+// This can be called repeatedly to change the interface speed (as some
+// batteries require).
+static uint32_t init_native_can(CAN_Speed speed, gpio_num_t tx_pin, gpio_num_t rx_pin) {
+  native_can_speed = speed;
+  native_tx_pin = tx_pin;
+  native_rx_pin = rx_pin;
+  native_speed.bitrate = (uint32_t)speed * 1000UL;
+
+  // (Re)start the CAN interface
+  return twai_lite.begin(native_speed, tx_pin, rx_pin) ? 0 : 1;
+}
+
+// Change the speed of the given CAN interface. Returns true if successful.
+bool change_can_speed(CAN_Interface interface, CAN_Speed speed) {
+  if (interface == CAN_Interface::CAN_NATIVE) {
+    // Reinitialize the native CAN interface with the new speed
+    const uint32_t errorCode = init_native_can(speed, native_tx_pin, native_rx_pin);
+    if (errorCode != 0) {
+      logging.print("Error Native Can: 0x");
+      logging.println(errorCode, HEX);
+      return false;
+    }
+    return true;
+  } else if (interface == CAN_Interface::CAN_ADDON_MCP2515 && can2515) {
+    can2515->changeSpeed({(int)speed * 1000UL, quartz_frequency});
+    return true;
+  }
+
+  return false;
+}
