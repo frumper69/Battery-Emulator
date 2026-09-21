@@ -15,6 +15,7 @@ class Mg4Battery : public UdsCanBattery {
 
   static constexpr const char* Name = "MG4 battery";
 
+  String get_uds_info_html() override;
   const char* get_dtc_json_filename() override { return "mg_dtc.json"; }
 
  private:
@@ -49,13 +50,12 @@ class Mg4Battery : public UdsCanBattery {
   // after N repeats of the current value" scheme is unsound: an intermediate
   // rung of the ramp (e.g. mux=1, 84 cells) can just as easily sit still for
   // N repeats as the true final value can, if the ramp happens to pace out
-  // slowly - which is exactly what a debounce-by-repeat-count approach did
-  // in practice. Instead, only commit once the highest mux value seen has
-  // gone CELL_COUNT_SETTLE_MS without being exceeded - i.e. wait for the
-  // ramp to visibly stop climbing, not for any one value to repeat. Also
-  // reject implausible mux values outright (0x159's subframes carry no CRC
-  // of their own, unlike 313/314/315's family) since a corrupted byte could
-  // otherwise masquerade as "the ramp settled high".
+  // slowly. Instead, only commit once the highest mux value seen has gone
+  // CELL_COUNT_SETTLE_MS without being exceeded - i.e. wait for the ramp to
+  // visibly stop climbing, not for any one value to repeat. Also reject
+  // implausible mux values outright (0x159's subframes carry no CRC of
+  // their own) since a corrupted byte could otherwise masquerade as "the
+  // ramp settled high".
   static const uint8_t MAX_PLAUSIBLE_MUX_0x510 = 10;  // 80+10*4=120 cells, headroom past every known variant
   static const unsigned long CELL_COUNT_SETTLE_MS = 1000;
   uint8_t highest_mux_0x510_seen = 0;
@@ -75,15 +75,74 @@ class Mg4Battery : public UdsCanBattery {
   int16_t module_temperatures_dC[12] = {0};
   int16_t module_temps_received = 0;
 
-  int sendPhase = 0;
+  // For monitoring the actual battery-reported contactor state.
+  struct PackContactorFeedback {
+    bool received = false;
+    uint8_t state = 0xFF;  // 0xFF = no data yet
+    bool isClosed() const { return received && state == 7; }
+    bool isPrecharging() const { return received && state == 11; }
+    // Value for datalayer.system.status.contactors_engaged (shown on the main
+    // BE contactor widget): 1=closed, 3=precharge active, 0=otherwise.
+    uint8_t contactsEngaged() const {
+      if (isClosed()) {
+        return 1;
+      }
+      if (isPrecharging()) {
+        return 3;
+      }
+      return 0;
+    }
+    const char* label() const {
+      if (!received) {
+        return "No data received yet";
+      }
+      switch (state) {
+        case 7:
+          return "Closed / charging";
+        case 11:
+          return "Precharge active";
+        case 3:
+          return "Idle";
+        default:
+          return "Unknown";
+      }
+    }
+    const char* color() const {
+      if (!received) {
+        return "#9e9e9e";  // Grey
+      }
+      switch (state) {
+        case 7:
+          return "#4CAF50";  // Green
+        case 11:
+          return "#ff9800";  // Orange
+        case 3:
+          return "#f44336";  // Red
+        default:
+          return "#9e9e9e";  // Grey
+      }
+    }
+  };
+
+  // Contactor management state machine.
+  enum class ContactorState {
+    WAITING_FOR_PACK,  // Silent: waiting for the first 0x15B state (or grace expiry)
+    CLOSING,           // Replaying the full message cycle from index 0
+    CLOSED,            // Pack confirmed closed, replaying the end of the cycle
+    OPENING,           // Open requested, replaying the start of the cycle
+  };
+
   bool reportsFDVoltages = false;
   bool reportsSoC = false;
   bool coulombCounting = false;
-  bool sendClosingMessagesFD = true;
-  bool prevSendClosingMessagesFD = false;
-  uint8_t precharge_contactor_state = 0xFF;  // 0x15B byte[21]&0xF: 3=idle, 11=precharge, 7=closed/charging
-  int replayFrameIndex047_08A = 0;           // cycles through the generated 047/08A segment
-  int replayFrameIndex313_314 = 0;           // cycles through the generated 313/314 segment
+  ContactorState contactorState = ContactorState::WAITING_FOR_PACK;
+  PackContactorFeedback pack_contactors;
+  unsigned long contactorWaitStartMillis = 0;  // Grace timer base while WAITING_FOR_PACK
+  int replayFrameIndex047_08A = 0;             // Master cursor through the message cycle; the
+                                               // 313/314/315 index is derived from it (see cpp)
+  int wakeupCounter = 0;                       // Paces the 0x4F3 FD wakeup keep-alive
+
+  void contactor_state_tick(unsigned long currentMillis);
 
   uint32_t total_discharge_dC = 0;  // in deci-Coulombs
   bool total_discharge_initialized = false;
@@ -91,7 +150,6 @@ class Mg4Battery : public UdsCanBattery {
   unsigned long lastTickMillis = 0;
 
   unsigned long previousMillis10 = 0;   // will store last time a 10ms CAN Message was send
-  unsigned long previousMillis100 = 0;  // will store last time a 100ms CAN Message was send
   unsigned long previousMillis200 = 0;  // will store last time a 200ms CAN Message was send
 
   uint32_t* nonvolatile_cookie = 0;
@@ -105,25 +163,16 @@ class Mg4Battery : public UdsCanBattery {
   static const uint16_t POLL_MAX_CELL_TEMPERATURE = 0xB056;
   static const uint16_t POLL_BATTERY_SOH = 0xB061;
 
-  CAN_frame MG4_4F3 = {.FD = false,
-                       .ext_ID = false,
-                       .DLC = 8,
-                       .ID = 0x4F3,
-                       .data = {0xF3, 0x10, 0x48, 0x00, 0xFF, 0xFF, 0x00, 0x11}};
-  CAN_frame MG4_047 = {.FD = false,
-                       .ext_ID = false,
-                       .DLC = 8,
-                       .ID = 0x047,
-                       .data = {0x00, 0x00, 0x45, 0x7D, 0x7F, 0xFF, 0xFF, 0xFE}};
-
   CAN_frame MG4_4F3_FD = {.FD = true,
                           .ext_ID = false,
                           .DLC = 8,
                           .ID = 0x4F3,
                           .data = {0xF3, 0x10, 0x48, 0x00, 0xFF, 0xFF, 0x00, 0x11}};
-  // 0x047 (FD), 0x08A, 0x313 and 0x314 are all populated at runtime by
-  // concise generators (see MG-4-FD-GENERATORS.h) rather than by replaying a
-  // long captured table.
+  // 0x047 (FD) and 0x08A are populated at runtime by concise generators (see
+  // MG-4-BATTERY.cpp) rather than by replaying a long captured table.
+  // (0x313/0x314/0x315 used to be generated the same way, but further
+  // testing found the pack doesn't need them, so they're no longer built or
+  // sent.)
   CAN_frame MG4_047_FD = {.FD = true,
                           .ext_ID = false,
                           .DLC = 24,
@@ -131,11 +180,4 @@ class Mg4Battery : public UdsCanBattery {
                           .data = {0x00, 0x01, 0x27, 0x08, 0xF4, 0xF0, 0x80, 0x04, 0x00, 0x5F, 0x3C, 0x00,
                                    0x00, 0x01, 0x48, 0x08, 0x61, 0xF0, 0x6A, 0x06, 0xA0, 0xFF, 0xF0, 0xFF}};
   CAN_frame MG4_08A_FD = {.FD = true, .ext_ID = false, .DLC = 48, .ID = 0x08A, .data = {0}};
-  CAN_frame MG4_313_FD = {.FD = true, .ext_ID = false, .DLC = 48, .ID = 0x313, .data = {0}};
-  CAN_frame MG4_314_FD = {.FD = true, .ext_ID = false, .DLC = 24, .ID = 0x314, .data = {0}};
-  // 0x315: seen alongside 0x313/0x314 in a genuine 64kWh NMC-pack capture
-  // (same "00 04 xx" sub-addressed family, sub-addresses 00 04 06/00 04 09)
-  // but never implemented here before - the pack briefly closed contactors
-  // then reopened them, which not sending this frame is a leading suspect for.
-  CAN_frame MG4_315_FD = {.FD = true, .ext_ID = false, .DLC = 24, .ID = 0x315, .data = {0}};
 };

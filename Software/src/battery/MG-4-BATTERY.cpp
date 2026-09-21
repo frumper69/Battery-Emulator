@@ -3,7 +3,6 @@
 #include <soc/soc.h>
 #include <cmath>    //For unit test
 #include <cstring>  //For unit test
-#include "MG-4-FD-GENERATORS.h"
 //#include "esp_timer.h"
 #include "../battery/BATTERIES.h"
 #include "../communication/can/comm_can.h"
@@ -535,6 +534,7 @@ void Mg4Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
                 cell_count_confirmed = true;
               }
             }
+            // 0x509 frames cover cells 1-80, 0x510 frames cover cells 81-104
             int celloffset = (addr == 0x509) ? (mux - 1) : 20 + (mux - 1);
 
             // Unpack the 4 cell voltages
@@ -607,26 +607,17 @@ void Mg4Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
         }
 
         // Precharge/contactor state, confirmed against a real vehicle
-        // capture: 3=idle, 11=precharge active, 7=closed/charging. Used to
-        // decide where the FD handshake segment loops back to.
-        if ((rx_frame.data.u8[21] & 0x0F) != precharge_contactor_state) {
-          precharge_contactor_state = rx_frame.data.u8[21] & 0x0F;
-          logging.printf("[MG4] Precharge/contactor state changed to %d\n", precharge_contactor_state);
+        // capture: 3=idle, 11=precharge active, 7=closed/charging. Single
+        // source of truth for the contactor state machine, the
+        // contactors_engaged reporting and the UDS info page.
+        if ((rx_frame.data.u8[21] & 0x0F) != pack_contactors.state) {
+          pack_contactors.state = rx_frame.data.u8[21] & 0x0F;
+          logging.printf("[MG4] Precharge/contactor state changed to %d\n", pack_contactors.state);
         }
+        pack_contactors.received = true;
 
-        // Reflect the pack's own contactor state on the main BE page (see
-        // battery_reports_contactor_state in setup()).
-        switch (precharge_contactor_state) {
-          case 7:  // Closed / charging
-            datalayer.system.status.contactors_engaged = 1;
-            break;
-          case 11:  // Precharge active
-            datalayer.system.status.contactors_engaged = 3;
-            break;
-          default:  // Idle (3), or no data yet (0xFF)
-            datalayer.system.status.contactors_engaged = 0;
-            break;
-        }
+        // Reflect the pack's own contactor state on the main BE page.
+        datalayer.system.status.contactors_engaged = pack_contactors.contactsEngaged();
         break;
       default:
         break;
@@ -660,10 +651,280 @@ void Mg4Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
   }
 }
 
-static const uint8_t FOURSEVEN_FIRST_BYTES[] = {
-    0x81, 0xDC, 0xB4, 0xE9, 0xE8, 0xB5, 0xDD, 0x0F, 0x53, 0x81, 0x66, 0xB4, 0x3A, 0x67, 0x0F,
-    0x81, 0x53, 0x3B, 0x66, 0xE8, 0xB5, 0xDD, 0x0F, 0x53, 0x0E, 0x66, 0xB4, 0x3A, 0xE8, 0x0F,
+// ===========================================================================
+// FD frame generators for the contactor-closing sequence (0x047, 0x08A).
+//
+// These are the runtime form of the standalone generators that used to live
+// in mg4_dev/*cycle_opt.cpp. Each FD payload is a sequence of back-to-back
+// 12-byte subfields with the layout:
+//
+//     [3-byte subaddr][len = 0x08][CRC-8][7 payload bytes]
+//
+// CRC-8: poly 0x1D, init 0x00, MSB-first, no reflection, no xorout, computed
+// over the 7 payload bytes that follow the CRC.
+//
+// Dynamic fields are either hardcoded to their closed/steady-state value or
+// run-length encoded from the original capture. 0x313/0x314/0x315 are no
+// longer sent (further testing found the pack doesn't need them), so their
+// generators and the curve-shaping helpers that only they used have been
+// removed.
+// ===========================================================================
+
+// Run-length encoded field: `value` is held for `count` consecutive frames.
+struct RleRun {
+  uint16_t value;
+  uint16_t count;
 };
+
+// CRC-8 (poly 0x1D, init 0x00, MSB-first, no reflection, no xorout) over the
+// 7 payload bytes following the CRC slot.
+static uint8_t payload_crc8(const uint8_t* d) {
+  uint8_t crc = 0x00;
+  for (uint8_t i = 0; i < 7; i++) {
+    crc ^= d[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+template <size_t N>
+static uint16_t rle_lookup(const RleRun (&runs)[N], int i) {
+  for (size_t r = 0; r < N; r++) {
+    if (i < (int)runs[r].count) {
+      return runs[r].value;
+    }
+    i -= runs[r].count;
+  }
+  return 0;  // index past end of segment - should not happen
+}
+
+// 0x047 VAL12 stays at its idle value until this many 10 ms frames in.
+static const uint32_t PRECHARGE_DELAY_FRAMES = 250 - 173;
+
+// --- Rolling counter -------------------------------------------------------
+// 15 values cycling with wrap, starting at base + offset on frame 0.
+static uint8_t rolling_counter(uint8_t base, int i, int offset) {
+  return (uint8_t)(base + ((i + offset) % 15));
+}
+
+// Frame-segment length (number of frames in the generated 047/08A cycle).
+static const int CYCLE_LEN_047 = 800 - 173;
+
+// ===========================================================================
+// 0x047 (24-byte FD payload, two 12-byte subfields)
+// ===========================================================================
+
+static const uint16_t VAL12_047_A_DC = 45;        // idle / DC offset
+static const uint32_t VAL12_047_A_SCALE_NUM = 2;  // frame value = 0.4 x voltage_dV
+static const uint32_t VAL12_047_A_SCALE_DEN = 5;
+static const uint16_t VAL12_047_A_FIELD_MAX = 0xFFF;  // 12-bit payload field saturation
+
+static const uint8_t BASE_047_A[12] = {0x00, 0x01, 0x27, 0x08, 0x00, 0x00, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t BASE_047_B[12] = {0x00, 0x01, 0x48, 0x08, 0x00, 0x00, 0x6A, 0x06, 0x00, 0xFF, 0xF0, 0xFF};
+
+// Assemble the 24-byte 0x047 FD payload for frame index i. The 12-bit VAL12
+// plateau tracks the live pack voltage (0.4 x voltage_dV at full precharge),
+// so `voltage_dV` comes from datalayer.battery.status.voltage_dV.
+static void build_frame_047(int i, uint16_t voltage_dV, uint8_t out[24]) {
+  uint32_t target = ((uint32_t)voltage_dV * VAL12_047_A_SCALE_NUM) / VAL12_047_A_SCALE_DEN;
+  if (i < PRECHARGE_DELAY_FRAMES) {
+    target = 0;
+  }
+  if (target < VAL12_047_A_DC) {
+    target = VAL12_047_A_DC;
+  } else if (target > VAL12_047_A_FIELD_MAX) {
+    target = VAL12_047_A_FIELD_MAX;
+  }
+
+  // Rolling counter: 0xF0..0xFE, starting at 0xFB on frame 0 (skips 0xFF)
+  uint8_t cnt = rolling_counter(0xF0, i, 11);
+
+  uint16_t val12 = target;
+  uint16_t mod = 0x01;
+  uint16_t flag = 0x9F;
+
+  // Subfield A
+  uint8_t a[12];
+  memcpy(a, BASE_047_A, 12);
+  a[5] = cnt;
+  a[9] = (uint8_t)(val12 >> 4);                    // VAL12 high 8 bits
+  a[10] = (uint8_t)(((val12 & 0xF) << 4) | 0x0C);  // VAL12 low 4 bits + static 0xC nibble
+  a[11] = (uint8_t)mod;
+  a[4] = payload_crc8(&a[5]);
+
+  // Subfield B
+  uint8_t b[12];
+  memcpy(b, BASE_047_B, 12);
+  b[5] = cnt;
+  b[8] = (uint8_t)flag;
+  b[4] = payload_crc8(&b[5]);
+
+  memcpy(out, a, 12);
+  memcpy(out + 12, b, 12);
+}
+
+// ===========================================================================
+// 0x08A (48-byte FD payload, four 12-byte subfields)
+// ===========================================================================
+
+// Subfield 2: MODE payload byte (0x00/0x01/0x21), 3 runs
+static const RleRun S100_08A_MODE_RLE[3] = {
+    {0x00, 190 - 173},
+    {0x01, 119},
+    {0x21, 491},
+};
+
+// Subfield 2: FLAG payload byte (0x00/0x08), 3 runs
+static const RleRun S100_08A_FLAG_RLE[3] = {
+    {0x00, 188 - 173},
+    {0x08, 219},
+    {0x00, 393},
+};
+
+// Subfield 3: LEVEL payload byte (0x00/0x20/0x40), 3 runs
+static const RleRun S153_08A_LEVEL_RLE[3] = {
+    {0x00, 307 - 173},
+    {0x20, 30},
+    {0x40, 463},
+};
+
+static const uint8_t BASE_08A_S118[12] = {0x00, 0x01, 0x18, 0x08, 0x00, 0x00, 0x75, 0x00, 0x75, 0x30, 0x75, 0x30};
+static const uint8_t BASE_08A_S100[12] = {0x00, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00};
+static const uint8_t BASE_08A_S153[12] = {0x00, 0x01, 0x53, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Assemble the 48-byte 0x08A FD payload for frame index i.
+static void build_frame_08a(int i, uint8_t out[48]) {
+  uint8_t s1[12], s2[12], s3[12];
+
+  // Subfield 1 (00 01 18)
+  memcpy(s1, BASE_08A_S118, 12);
+  s1[5] = rolling_counter(0x30, i, 11);
+  s1[7] = 0x2F;
+  s1[4] = payload_crc8(&s1[5]);
+
+  // Subfield 2 (00 01 00)
+  memcpy(s2, BASE_08A_S100, 12);
+  s2[5] = rolling_counter(0x40, i, 11);
+  // I suspect S100_08A_MODE_RLE is the contactor close request?
+  s2[7] = (uint8_t)rle_lookup(S100_08A_MODE_RLE, i);
+  s2[8] = (uint8_t)rle_lookup(S100_08A_FLAG_RLE, i);
+  s2[11] = 0xFF;
+  s2[4] = payload_crc8(&s2[5]);
+
+  // Subfield 3 (00 01 53) - CRC slot stays 0x00, as captured
+  memcpy(s3, BASE_08A_S153, 12);
+  s3[6] = (uint8_t)rle_lookup(S153_08A_LEVEL_RLE, i);
+
+  memcpy(out, s1, 12);
+  memcpy(out + 12, s2, 12);
+  memcpy(out + 24, s3, 12);
+  memset(out + 36, 0, 12);  // subfield 4: all-zero padding
+}
+
+// --- Contactor state machine constants -------------------------------------
+// Geometry of the generated message cycle (frames; see the FD frame
+// generators above):
+// 0x047/0x08A are generated at 10ms, driven from one master cursor
+// (replayFrameIndex047_08A). (0x313/0x314/0x315 used to run alongside them at
+// 1/10th the rate, derived from the same cursor, but further testing found
+// the pack doesn't need them, so they're no longer generated or sent.)
+//
+// The cycle opens with an idle period whose 0x08A "open request" bit holds the
+// pack's contactors open, so:
+//   - looping the first OPEN_LOOP_LEN frames of it keeps the contactors open,
+//   - replaying it from index 0 closes them (precharge ramp included), and
+//   - once the pack confirms closed (0x15B state == 7) the cycle restarts from
+//     the already-closed tail instead, which would otherwise open and reclose
+//     the contactors every time the loop wrapped.
+static constexpr int OPEN_LOOP_LEN_047_08A = 15;                   // first 1.5s of the cycle
+static constexpr int CLOSED_TAIL_START_047_08A = 304;              // already-closed tail of the cycle
+static constexpr unsigned long CONTACTOR_STARTUP_GRACE_MS = 5000;  // max wait for the first 0x15B state
+
+void Mg4Battery::contactor_state_tick(unsigned long currentMillis) {
+  const bool open_requested = (datalayer.system.status.system_status == FAULT);
+
+  switch (contactorState) {
+    case ContactorState::WAITING_FOR_PACK:
+      // We don't know the current pack state yet.
+
+      if (open_requested) {
+        // If an open is requested, we should proceed with that immediately.
+        logging.printf("[MG4] Contactor open requested, looping open segment of the message cycle\n");
+        replayFrameIndex047_08A = 0;
+        contactorState = ContactorState::OPENING;
+      } else if (pack_contactors.received || currentMillis - contactorWaitStartMillis >= CONTACTOR_STARTUP_GRACE_MS) {
+        // We now know the pack state, or have given up waiting for it.
+
+        contactorWaitStartMillis = 0;
+        if (pack_contactors.isClosed()) {
+          // Pack contactors were already closed (eg, we rebooted without opening them).
+          // Keep them closed.
+          logging.printf("[MG4] Pack contactors already closed, resuming at closed tail\n");
+          replayFrameIndex047_08A = CLOSED_TAIL_START_047_08A;
+          contactorState = ContactorState::CLOSED;
+        } else {
+          // Pack contactors are open, start the closing sequence from the beginning.
+          logging.printf("[MG4] Pack contactors open (state %d), starting closing sequence from the beginning\n",
+                         pack_contactors.received ? (int)pack_contactors.state : -1);
+          replayFrameIndex047_08A = 0;
+          contactorState = ContactorState::CLOSING;
+        }
+      } else if (contactorWaitStartMillis == 0) {
+        // Start the grace period timer
+        contactorWaitStartMillis = currentMillis;
+      }
+      break;
+
+    case ContactorState::CLOSING:
+      // We're replaying the contactor-close sequence.
+
+      if (open_requested) {
+        // Open was requested, abort!
+        logging.printf("[MG4] Contactor open requested, looping open segment of the message cycle\n");
+        replayFrameIndex047_08A = 0;
+        contactorState = ContactorState::OPENING;
+      } else if (pack_contactors.isClosed()) {
+        // The sequence has worked, the pack has closed.
+        // We'll now stay in the closed state.
+        contactorState = ContactorState::CLOSED;
+      }
+      break;
+
+    case ContactorState::CLOSED:
+      // The contactors are (presumably) currently closed.
+
+      if (open_requested) {
+        // Open requested, do that immediately.
+        logging.printf("[MG4] Contactor open requested, looping open segment of the message cycle\n");
+        replayFrameIndex047_08A = 0;
+        contactorState = ContactorState::OPENING;
+      } else if (pack_contactors.received && !pack_contactors.isClosed()) {
+        // The contactors opened by themselves. Try to reclose them by
+        // restarting the closing sequence.
+        logging.printf("[MG4] Pack contactors no longer closed (state %d), replaying closing sequence\n",
+                       (int)pack_contactors.state);
+        replayFrameIndex047_08A = 0;
+        contactorState = ContactorState::CLOSING;
+      }
+      break;
+
+    case ContactorState::OPENING:
+      // We're waiting for contactors to open.
+
+      if (!open_requested) {
+        // Close was requested during opening. Go to the waiting state until
+        // we've figured out what the pack is doing (we don't know how far the
+        // opening got).
+
+        logging.printf("[MG4] Closing re-enabled, waiting for pack contactor state\n");
+        contactorWaitStartMillis = 0;
+        contactorState = ContactorState::WAITING_FOR_PACK;
+      }
+      break;
+  }
+}
 
 void Mg4Battery::transmit_can(unsigned long currentMillis) {
   if (datalayer.system.status.bms_reset_status != BMS_RESET_IDLE) {
@@ -676,122 +937,34 @@ void Mg4Battery::transmit_can(unsigned long currentMillis) {
   if (currentMillis - previousMillis10 >= INTERVAL_10_MS) {
     previousMillis10 = currentMillis;
 
-    if (sendPhase == 3 || sendPhase == 13 || sendPhase == 23) {
-      // Non-FD 4F3 (PTEXT wakeup) is not sent - closing works over FD alone.
-    }
+    contactor_state_tick(currentMillis);
 
-    // 0x047 (FD) and 0x08A: generated closing-handshake frames (see
-    // MG-4-FD-GENERATORS.h). Both are stepped together once per 10ms tick.
-    //
-    // The full segment starts with an idle period whose 0x08A "open request"
-    // bit would cause a repeating open/close cycle every time the loop wraps,
-    // so once the pack has confirmed closed (0x15B state == 7) the loop
-    // restarts from the already-closed tail of the segment instead.
-    //
-    // Two table sets exist: the original, built from an LFP pack's capture,
-    // whose closed-tail is only ~5-8s long; and a variant built from a real
-    // 64kWh NMC pack's capture, whose closed-tail is ~43s. The LFP tables
-    // looping that fast is fine for the LFP pack, but the NMC pack's BMS was
-    // observed to reopen contactors after ~15s (~3 loop cycles) when fed the
-    // LFP-derived tables - the NMC variant exists to give it a lot more
-    // non-repeating real traffic before it would ever loop.
-    // Explicit NMC check (not "!= LFP") so the brief window before chemistry
-    // auto-detection resolves (datalayer.battery.info.chemistry still
-    // Autodetect) falls back to the LFP-derived tables rather than NMC's.
-    const bool use_nmc_tables = (datalayer.battery.info.chemistry == battery_chemistry_enum::NMC);
-    const int len_047_08a = use_nmc_tables ? mg4_fd::LEN_047_08A_NMC : mg4_fd::LEN_047;
-    const int closed_tail_047_08a = use_nmc_tables ? mg4_fd::CLOSED_TAIL_START_047_08A_NMC : 304;
-    const int len_313_314_315 = use_nmc_tables ? mg4_fd::LEN_313_314_315_NMC : mg4_fd::LEN_313;
-    const int closed_tail_313_314_315 = use_nmc_tables ? mg4_fd::CLOSED_TAIL_START_313_314_315_NMC : 30;
-
-    sendClosingMessagesFD = (datalayer.system.status.system_status != FAULT);
-
-    // Reset to the start of the segment whenever closing is (re)enabled -
-    // including on a fresh boot. If the pack is already reporting closed
-    // (e.g. this is a software restart rather than a real power-cycle), jump
-    // straight into the closed tail instead.
-    if (sendClosingMessagesFD && !prevSendClosingMessagesFD) {
-      if (precharge_contactor_state == 7) {
-        replayFrameIndex047_08A = closed_tail_047_08a;
-        replayFrameIndex313_314 = closed_tail_313_314_315;
-      } else {
-        replayFrameIndex047_08A = 0;
-        replayFrameIndex313_314 = 0;
-      }
-    }
-    prevSendClosingMessagesFD = sendClosingMessagesFD;
-
-    if (sendClosingMessagesFD) {
-      if (use_nmc_tables) {
-        mg4_fd::gen047_nmc::build(replayFrameIndex047_08A, datalayer.battery.status.voltage_dV, MG4_047_FD.data.u8);
-        mg4_fd::gen08a_nmc::build(replayFrameIndex047_08A, MG4_08A_FD.data.u8);
-      } else {
-        mg4_fd::gen047::build(replayFrameIndex047_08A, datalayer.battery.status.voltage_dV, MG4_047_FD.data.u8);
-        mg4_fd::gen08a::build(replayFrameIndex047_08A, MG4_08A_FD.data.u8);
-      }
+    if (contactorState != ContactorState::WAITING_FOR_PACK) {
+      build_frame_047(replayFrameIndex047_08A, datalayer.battery.status.voltage_dV, MG4_047_FD.data.u8);
+      build_frame_08a(replayFrameIndex047_08A, MG4_08A_FD.data.u8);
       transmit_can_frame(&MG4_047_FD);
       transmit_can_frame(&MG4_08A_FD);
-    }
 
-    replayFrameIndex047_08A++;
-    if (precharge_contactor_state == 7) {
-      if (replayFrameIndex047_08A >= len_047_08a) {
-        replayFrameIndex047_08A = closed_tail_047_08a;
-      }
-    } else if (replayFrameIndex047_08A >= len_047_08a) {
-      replayFrameIndex047_08A = 0;
-    }
-
-    if (currentMillis - previousMillis100 >= INTERVAL_100_MS) {
-      previousMillis100 = currentMillis;
-
-      // 0x313/0x314/0x315: generated companion frames, sent at 100ms and kept
-      // in step with the 10ms segment above. 0x315 is only known to be
-      // needed by some packs (seen on a 64kWh NMC pack, not the original LFP
-      // capture this driver was built from) - sending it unconditionally
-      // here should be harmless for packs that don't need it.
-      if (sendClosingMessagesFD) {
-        if (use_nmc_tables) {
-          mg4_fd::gen313_nmc::build(replayFrameIndex313_314, datalayer.battery.status.voltage_dV, MG4_313_FD.data.u8);
-          mg4_fd::gen314_nmc::build(replayFrameIndex313_314, MG4_314_FD.data.u8);
-          mg4_fd::gen315_nmc::build(replayFrameIndex313_314, MG4_315_FD.data.u8);
-        } else {
-          mg4_fd::gen313::build(replayFrameIndex313_314, datalayer.battery.status.voltage_dV, MG4_313_FD.data.u8);
-          mg4_fd::gen314::build(replayFrameIndex313_314, MG4_314_FD.data.u8);
-          mg4_fd::gen315::build(replayFrameIndex313_314, MG4_315_FD.data.u8);
-        }
-        transmit_can_frame(&MG4_313_FD);
-        transmit_can_frame(&MG4_314_FD);
-        transmit_can_frame(&MG4_315_FD);
-      }
-
-      replayFrameIndex313_314++;
-      if (precharge_contactor_state == 7) {
-        if (replayFrameIndex313_314 >= len_313_314_315) {
-          replayFrameIndex313_314 = closed_tail_313_314_315;
-        }
-      } else if (replayFrameIndex313_314 >= len_313_314_315) {
-        replayFrameIndex313_314 = 0;
+      // Calculate the start/end indices for the replay
+      int wrap_start = (contactorState == ContactorState::CLOSED) ? CLOSED_TAIL_START_047_08A : 0;
+      int wrap_limit = (contactorState == ContactorState::OPENING) ? OPEN_LOOP_LEN_047_08A : CYCLE_LEN_047;
+      // Wrap if necessary
+      if (++replayFrameIndex047_08A >= wrap_limit) {
+        replayFrameIndex047_08A = wrap_start;
       }
     }
 
-    // Send the non-FD 047 frame to close contactors on PTEXT.
-    MG4_047.data.u8[0] = FOURSEVEN_FIRST_BYTES[sendPhase];
-    if (sendPhase >= 0xf) {
-      MG4_047.data.u8[1] = sendPhase - 0xf;
-    } else {
-      MG4_047.data.u8[1] = sendPhase;
-    }
-    // Non-FD 047 (PTEXT) is not sent - closing works over FD alone.
+    // (0x313/0x314/0x315 used to be generated and sent here, every 100ms.
+    // Further testing found the pack doesn't need them, so that block - and
+    // build_frame_313/314/315 above - has been removed. previousMillis100
+    // went with it, since nothing else on this driver runs on a 100ms tick.)
 
-    if (sendPhase == 2 || sendPhase == 12 || sendPhase == 22) {
-      // Send a FD 4F3 to wake up the FD interface.
+    // 0x4F3 (FD) wakeup keep-alive, every 100ms. This was the only live part
+    // of the old non-FD 047/sendPhase PTEXT cycle - closing works over FD
+    // alone, so the non-FD frames are gone.
+    if (++wakeupCounter >= 10) {
+      wakeupCounter = 0;
       transmit_can_frame(&MG4_4F3_FD);
-    }
-
-    sendPhase++;
-    if (sendPhase >= 30) {
-      sendPhase = 0;
     }
   }
 
@@ -832,23 +1005,23 @@ uint16_t Mg4Battery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* dat
 void Mg4Battery::apply_cell_voltage_limits() {
   // Danger limits
   if (datalayer.battery.info.chemistry == battery_chemistry_enum::LFP) {
-    datalayer.battery.info.max_cell_voltage_mV = 3700;
+    datalayer.battery.info.max_cell_voltage_mV = 3760;
     datalayer.battery.info.min_cell_voltage_mV = 2500;
   } else if (datalayer.battery.info.chemistry == battery_chemistry_enum::Autodetect) {
     // Chemistry not yet known (auto-detect pending, see handle_incoming_can_frame's
     // 0x12C handling). Use the safe intersection of every known MG4 variant's
-    // limits until real telemetry resolves it: LFP's own ceiling (3700mV) is a
+    // limits until real telemetry resolves it: LFP's own ceiling (3760mV) is a
     // safe upper bound for an NMC pack too (just conservative), and NMC's own
     // floor (2700mV) is a safe lower bound for an LFP pack too (LFP's real
     // floor is lower, at 2500mV, so 2700mV stays inside it).
-    datalayer.battery.info.max_cell_voltage_mV = 3700;
+    datalayer.battery.info.max_cell_voltage_mV = 3760;
     datalayer.battery.info.min_cell_voltage_mV = 2700;
   } else {
     datalayer.battery.info.max_cell_voltage_mV = 4250;
     datalayer.battery.info.min_cell_voltage_mV = 2700;
   }
 
-  working_cell_max_mV = datalayer.battery.info.max_cell_voltage_mV - 150;
+  working_cell_max_mV = datalayer.battery.info.max_cell_voltage_mV - 10;
   working_cell_min_mV = datalayer.battery.info.min_cell_voltage_mV + 300;
   working_cell_recharge_threshold_mV = working_cell_max_mV - 100;
   if (coulombCounting) {
@@ -890,16 +1063,11 @@ void Mg4Battery::setup(void) {  // Performs one time setup at startup
   strncpy(datalayer.system.info.battery_protocol, Name, 63);
   datalayer.system.info.battery_protocol[63] = '\0';
   datalayer.system.status.battery_allows_contactor_closing = true;
-  // The pack has its own internal, BMS-controlled contactors, driven via CAN
-  // rather than by BE-driven external relays. This tells the webserver to
-  // show detailed contactor status (via contactors_engaged) even when
-  // contactor_control_enabled is false.
-  datalayer.system.status.battery_reports_contactor_state = true;
 
   datalayer.battery.info.chemistry = user_selected_battery_chemistry;
   // Start from the 104s default (the most common known variant so far); the
   // 0x510 mux-based auto-detect in handle_incoming_can_frame() will correct
-  // this within a few seconds for 100s/108s packs.
+  // this within a couple of seconds for 100s/108s packs.
   datalayer.battery.info.number_of_cells = 104;
   datalayer.battery.info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_MV;
   coulombCounting = user_selected_use_estimated_SOC;
@@ -924,4 +1092,17 @@ void Mg4Battery::setup(void) {  // Performs one time setup at startup
   // // set to a random value
   // *nonvolatile_cookie = esp_timer_get_time();
   // logging.printf("Nonvolatile cookie set to %lu\n", *nonvolatile_cookie);
+}
+
+String Mg4Battery::get_uds_info_html() {
+  // Pack-reported precharge/contactor state (0x15B byte[21]&0xF)
+  String html = "<h3>Precharge/contactor state</h3>";
+  html += "<div style='border: 1px solid #ccc; padding: 5px;'>";
+  html += "<span style='display: inline-block; width: 14px; height: 14px; background-color: " +
+          String(pack_contactors.color()) + "; margin-right: 6px;'></span>";
+  html += "State: " + String(pack_contactors.received ? String(pack_contactors.state) : String("n/a")) + " (" +
+          pack_contactors.label() + ")";
+  html += "</div>";
+
+  return html;
 }
